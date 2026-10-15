@@ -63,7 +63,8 @@ module fast_cycle_sync(
 	output [10:0] FVRAM_ADDR,
 	input [15:0] FVRAM_DATA_IN,
 	output [15:0] FVRAM_DATA_OUT,
-	output CWE
+	output CWE,
+	output CPU_READ_HIGH_UPD        // CPU read latch loaded (used by the 68K overclock)
 );
 
 	wire [10:0] C;
@@ -499,5 +500,7 @@ module fast_cycle_sync(
 	FDS16bit P155(N98_QD, PIPE_B, PIPE_C);
 	assign HSHRINK = PIPE_C[12:9];
 	*/
+
+	assign CPU_READ_HIGH_UPD = CLK_CPU_READ_HIGH_FALL;
 
 endmodule

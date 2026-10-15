@@ -42,7 +42,6 @@ module emu
 );
 
 assign ADC_BUS  = 'Z;
-assign USER_OUT = '1;
 assign {UART_RTS, UART_TXD, UART_DTR} = 0;
 assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
@@ -113,7 +112,7 @@ video_freak video_freak
 // 0         1         2         3          4         5         6   
 // 01234567890123456789012345678901 23456789012345678901234567890123
 // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
-// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXX            XXXXXX 
+// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXXXXX         XXXXXX 
 
 `include "build_id.v"
 localparam CONF_STR = {
@@ -136,9 +135,13 @@ localparam CONF_STR = {
 	"O1,System Type,Console(AES),Arcade(MVS);",
 	"OM,BIOS,UniBIOS,Original;",
 	"O3,Video Mode,NTSC,PAL;",
+	"oDE,68K Speed,12MHz,18MHz,24MHz;",
+	"oF,Sprites per Line,96 (Original),No Limit;",
+	"oG,Cart Wait States,Original,Off;",
 	"-;",
 	"o9A,Input,Joystick or Spinner,Joystick,Spinner,Mouse(Irr.Maze);",
 	"oBC,Multitap,No,NEO-FTC1B,NeoTris;",
+	"oH,User Port,Off,DB15 Joystick;",
 	"-;",
 	"H0O4,Memory Card,Plugged,Unplugged;",
 	"RL,Reload Memory Card;",
@@ -310,8 +313,10 @@ wire  [1:0] sd_wr;
 wire  [1:0] sd_rd;
 wire  [1:0] sd_ack;
 
-wire [15:0] joystick_0;	// 21--HNLS DCBAUDLR  (1=A+B, 2=C+D combos)
-wire [15:0] joystick_1;
+wire [15:0] usb_joystick_0, usb_joystick_1;
+wire [15:0] db15_joy_0, db15_joy_1;	// DB15 user-port pads (TREX v10)
+wire [15:0] joystick_0 = usb_joystick_0 | db15_joy_0;	// 21--HNLS DCBAUDLR  (1=A+B, 2=C+D combos); USB + DB15
+wire [15:0] joystick_1 = usb_joystick_1 | db15_joy_1;
 wire [15:0] joystick_2;
 wire [15:0] joystick_3;
 wire  [8:0] spinner_0, spinner_1;
@@ -343,7 +348,7 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(2)) hps_io
 
 	.forced_scandoubler(forced_scandoubler),
 
-	.joystick_0(joystick_0), .joystick_1(joystick_1),
+	.joystick_0(usb_joystick_0), .joystick_1(usb_joystick_1),
 	.joystick_2(joystick_2), .joystick_3(joystick_3),
 	.spinner_0(spinner_0), .spinner_1(spinner_1),
 	.ps2_mouse(ps2_mouse),
@@ -381,6 +386,30 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(2)) hps_io
 	.EXT_BUS(EXT_BUS)
 );
 
+// TREX v10: DB15 splitter on the user port (OSD "User Port"), status[49].
+wire db15_en = status[49];
+wire db15_clk, db15_load;
+wire [11:0] db15_1, db15_2;	// active high: Select,Start,F,E,D,C,B,A,U,D,L,R
+assign USER_PP  = db15_en;
+assign USER_OUT = db15_en ? {5'h1f, db15_clk, db15_load} : 7'h7f;
+
+neo_db15 neo_db15
+(
+	.clk(clk_sys),
+	.joy_clk(db15_clk),
+	.joy_load(db15_load),
+	.joy_data(USER_IN[5]),
+	.joystick1(db15_1),
+	.joystick2(db15_2)
+);
+
+// DB15 buttons -> core layout (bit 10 Coin, 9 Select, 8 Start, 7-4 D C B A, 3-0 U D L R)
+function [15:0] db15_map(input [11:0] j);
+	db15_map = {5'd0, j[8], j[11], j[10], j[7:0]};
+endfunction
+assign db15_joy_0 = db15_en ? db15_map(db15_1) : 16'd0;
+assign db15_joy_1 = db15_en ? db15_map(db15_2) : 16'd0;
+
 reg [7:0] ioctl_index;
 always @(posedge clk_sys) ioctl_index <= ioctl_idx;
 
@@ -415,6 +444,27 @@ wire CD_nRESET_Z80;
 // Clocks
 wire CLK_EN_12M, CLK_EN_12M_N, CLK_68KCLK, CLK_68KCLKB, CLK_EN_6MB, CLK_EN_1HB, CLK_EN_4M_P, CLK_EN_4M_N, CLK_EN_68K_P, CLK_EN_68K_N;
 
+// 68000 overclock (OSD "68K Speed"): 12MHz (original), 18MHz or 24MHz
+// Only the CPU and the logic that follows its bus cycles (NEO-C1 wait states,
+// system latch) use the faster enables. Video, sound, Z80, timers and the CD
+// interface keep the original clocks. The speed is taken while the CPU is in
+// reset, so a change applies on "Reset & apply" and never mid bus cycle.
+wire CPU_EN_P, CPU_EN_N, CPU_OVERCLOCK;
+wire CPU_SLOW;	// 68000 back to the stock rate for now (see sound sync below)
+
+cpu_speed CPU_SPEED(
+	.CLK(CLK_48M),
+	.nRESET(nRESET),
+	.SPEED(status[46:45]),
+	.SLOW(CPU_SLOW),
+	.CLK_EN_68K_P(CLK_EN_68K_P),
+	.CLK_EN_68K_N(CLK_EN_68K_N),
+	.CPU_EN_P(CPU_EN_P),
+	.CPU_EN_N(CPU_EN_N),
+	.OVERCLOCK(CPU_OVERCLOCK)
+);
+
+
 // 68k stuff
 wire [15:0] M68K_DATA;
 wire [23:1] M68K_ADDR;
@@ -437,6 +487,32 @@ wire nPORTOEL, nPORTOEU, nPORTWEL, nPORTWEU, nPORTADRS;
 wire nSRAMOEL, nSRAMOEU, nSRAMWEL, nSRAMWEU;
 wire nWRL, nWRU, nWWL, nWWU;
 wire nLSPOE, nLSPWE;
+
+// LSPC VRAM access pacing for the overclocked 68000
+// The LSPC takes CPU VRAM writes and reads in its own time slots. At 12MHz the
+// 68000 can't get ahead of it, but at 18/24MHz it would overwrite a pending
+// write or read a stale latch. When the CPU accesses the VRAM registers
+// ($3C0000/2/4) while the LSPC is still busy with the previous access, the
+// access is held back (LSPC strobes and DTACK) until the LSPC is free. Then it
+// goes through once, and DTACK waits 3 more clocks so read data is valid.
+wire LSPC_VRAM_BUSY, LSPC_VRAM_WR_BUSY;
+wire lspc_vram_acc = (~nLSPWE & (M68K_ADDR[3:1] <= 3'd2)) | (~nLSPOE & ~M68K_ADDR[2]);
+reg  lspc_granted = 0, lspc_waited = 0;
+reg  [1:0] lspc_dly = 0;
+wire lspc_hold = CPU_OVERCLOCK & lspc_vram_acc & ~lspc_granted & (~nLSPWE ? LSPC_VRAM_WR_BUSY : LSPC_VRAM_BUSY);
+wire lspc_dtack_wait = lspc_hold | (lspc_waited & (lspc_dly != 2'd3));
+
+always @(posedge CLK_48M) begin
+	if (!lspc_vram_acc) begin
+		lspc_granted <= 0;
+		lspc_waited  <= 0;
+		lspc_dly     <= 0;
+	end else begin
+		if (lspc_hold) lspc_waited  <= 1;
+		else           lspc_granted <= 1;
+		if (lspc_granted && lspc_dly != 2'd3) lspc_dly <= lspc_dly + 2'd1;
+	end
+end
 wire nPAL, nPAL_WE;
 wire nBITW0, nBITW1, nBITWD0, nDIPRD0, nDIPRD1;
 wire nSDROE, nSDPOE;
@@ -538,8 +614,13 @@ wire [2:0] cart_pchip = cfg[22:20];
 wire       use_pcm    = cfg[23];
 wire [1:0] cart_chip  = cfg[25:24]; // legacy option: 0 - none, 1 - PRO-CT0, 2 - Link MCU
 wire [1:0] cmc_chip   = cfg[27:26]; // type 1/2
-wire       rom_wait   = cfg[28];    // ROMWAIT from cart. 0 - Full speed, 1 - 1 wait cycle
-wire [1:0] p_wait     = cfg[30:29]; // PWAIT from cart. 0 - Full speed, 1 - 1 wait cycle, 2 - 2 cycles
+// OSD "Cart Wait States: Off" (status[48]) drops the cart's ROM/port wait
+// states. Only a few carts set them (Ninja Combat, Ninja Commando, KOF94:
+// ROMWAIT; KOF94-2001, Fatal Fury 3, Real Bout 2: PWAIT). The ROM is in SDRAM,
+// and nDTACK still waits for PROM_DATA_READY, so reads stay correct.
+wire       no_cart_wait = status[48];
+wire       rom_wait   = cfg[28] & ~no_cart_wait;           // ROMWAIT from cart. 0 - Full speed, 1 - 1 wait cycle
+wire [1:0] p_wait     = cfg[30:29] & {2{~no_cart_wait}};   // PWAIT from cart. 0 - Full speed, 1 - 1 wait cycle, 2 - 2 cycles
 wire       cd_en      = cfg[31];    // Neo CD
 
 // Memory card and backup ram image save/load
@@ -761,11 +842,36 @@ wire CD_DATA_WR = ioctl_wr_x & CD_DATA_DOWNLOAD;
 wire CDDA_DOWNLOAD = ioctl_download & (ioctl_index[5:0] == 6'h04);
 wire CDDA_WR = ioctl_wr_x & CDDA_DOWNLOAD;
 
+// CD register pacing for the overclocked 68000
+// The CD registers ($FF0000-$FF0FFF) look for 68000 strobe edges at the stock
+// 12MHz rate. A faster 68000 can start and end a whole access (or go straight
+// from one access to the next) between two of those samples. When overclocked,
+// the CD system sees the strobes of such an access only after one 12MHz sample
+// has seen them inactive, and DTACK waits until two more samples have seen them
+// active, so every access is seen exactly once, as at 12MHz.
+wire cd_reg_acc = SYSTEM_CDx & ~nAS & (M68K_ADDR[23:12] == 12'hFF0);
+reg  cd_reg_armed = 0;
+reg  [1:0] cd_reg_cnt = 0;
+always @(posedge CLK_48M) begin
+	if (!cd_reg_acc) begin
+		cd_reg_armed <= 0;
+		cd_reg_cnt   <= 0;
+	end else if (CLK_EN_68K_P) begin
+		cd_reg_armed <= 1;
+		if (cd_reg_armed && cd_reg_cnt != 2'd3) cd_reg_cnt <= cd_reg_cnt + 2'd1;
+	end
+end
+wire cd_reg_mask = CPU_OVERCLOCK & cd_reg_acc & ~cd_reg_armed;
+wire cd_dtack_wait = CPU_OVERCLOCK & cd_reg_acc & (cd_reg_cnt < 2'd2);
+wire cd_nAS  = nAS  | cd_reg_mask;
+wire cd_nLDS = nLDS | cd_reg_mask;
+wire cd_nUDS = nUDS | cd_reg_mask;
+
 cd_sys #(.MCLK(CD_MCLK)) cdsystem(
 	.nRESET(nRESET),
 	.clk_sys(CLK_48M), .CLK_68KCLK_EN(CLK_EN_68K_P),
 	.M68K_ADDR(M68K_ADDR), .M68K_DATA(M68K_DATA), .A22Z(A22Z), .A23Z(A23Z),
-	.nLDS(nLDS), .nUDS(nUDS), .M68K_RW(M68K_RW), .nAS(nAS), .nDTACK(nDTACK_ADJ),
+	.nLDS(cd_nLDS), .nUDS(cd_nUDS), .M68K_RW(M68K_RW), .nAS(cd_nAS), .nDTACK(nDTACK_ADJ),
 	.nBR(nBR), .nBG(nBG), .nBGACK(nBGACK),
 	.SYSTEM_CDx(SYSTEM_CDx),
 	.CD_REGION(CD_REGION),
@@ -814,6 +920,7 @@ wire nPORTOE = nPORTOEL & nPORTOEU;
 wire CD_EXT_RD = DMA_RUNNING ? (SYSTEM_CDx & (DMA_ADDR_IN[23:21] == 3'd0) & DMA_RD_OUT) :		// DMA reads from $000000~$1FFFFF
 										 (SYSTEM_CDx & (~nWRL | ~nWRU));											// CPU reads from $100000~$1FFFFF
 
+wire        CD_WR_PENDING;
 wire        sdram_ready;
 wire [26:1] sdram_addr;
 wire [15:0] sdram_dout;
@@ -930,6 +1037,22 @@ always @(posedge CLK_96M) begin
 	ioctl_wr_rd1 <= ioctl_wr_rd;
 end
 
+// extra sprite renderer (neo_xspr) <-> SDRAM mux, VRAM/LO ROM ports, LSPC, B1
+wire        XS_REQ, XS_ACK;
+wire [26:0] XS_ADDR;
+wire [63:0] XS_DATA;
+wire [10:0] XFV_ADDR;
+wire [15:0] XFV_Q;
+wire [14:0] XSV_ADDR;
+wire [15:0] XSV_Q;
+wire [15:0] XLO_ADDR;
+wire  [7:0] XLO_Q;
+wire  [8:0] XSPR_RASTERC, XSPR_PIXELC;
+wire  [2:0] XSPR_AA_COUNT;
+wire        XSPR_AA_DISABLE;
+wire [11:0] XSPR_PIXEL;
+wire        XSPR_OPAQUE;
+
 wire SDRAM_WR;
 wire SDRAM_RD;
 wire SDRAM_RFSH;
@@ -954,6 +1077,7 @@ sdram_mux SDRAM_MUX(
 	.P2ROM_ADDR(P2ROM_ADDR & P2ROM_MASK),
 	.PROM_DATA(PROM_DATA),
 	.PROM_DATA_READY(PROM_DATA_READY),
+	.CD_WR_PENDING(CD_WR_PENDING),
 
 	.CD_TR_AREA(CD_TR_AREA),
 	.CD_EXT_WR(CD_EXT_WR),
@@ -990,6 +1114,11 @@ sdram_mux SDRAM_MUX(
 	.DL_WR(~ioctl_wr_rd1 & ioctl_wr_rd),
 
 	.REFRESH_EN(RFSH),
+
+	.XS_REQ(XS_REQ),
+	.XS_ADDR(XS_ADDR),
+	.XS_ACK(XS_ACK),
+	.XS_DATA(XS_DATA),
 
 	.SDRAM_ADDR(sdram_addr),
 	.SDRAM_DOUT(sdram_dout),
@@ -1126,17 +1255,91 @@ wire [1:0] CD_IPL = {IPL1,IPL0} == 2'b01 ? 2'b00     // Level 3 Timer
 
 wire [1:0] IPL_OUT = ~SYSTEM_CDx ? { IPL1,IPL0 } : CD_IPL;
 
+// Sound CPU sync for the overclocked 68000
+// Games time some of their talks with the Z80 with CPU loops written for 12MHz:
+// after sending $01 (prepare for slot switch) or $03 (Z80 soft reset) they
+// wait a fixed number of loops for the Z80 to be ready, and they poll
+// REG_SOUND for replies with loop-count timeouts. Overclocked, those waits end
+// too early and the next sound commands are lost (no music, or no sound at
+// all). So the 68000 briefly goes back to its stock rate:
+// - for 250ms after writing $01 or $03 to REG_SOUND (SNK asks for the Z80
+//   reset to take under 100ms, so stock-timed waits fit in that),
+// - while the 68000 keeps reading REG_SOUND (reads less than 0.5ms apart),
+//   and for 2ms after the last of them.
+// A single read or write of REG_SOUND per frame doesn't slow anything down.
+// Neo Geo CD: the BIOS talks to the CD drive (a slow MCU, emulated at 250kHz)
+// through a 4-bit handshake in the CD registers, with loop-count timeouts in
+// its polling. At 24MHz those time out and the BIOS never gets past its boot
+// screen. So any CD register access ($FF0000-$FF0FFF) also puts the 68000 at
+// its stock rate, for 1ms after the last one (the drive exchange happens 64
+// times a second and takes about 0.3ms).
+// On top of that (v6), all other CD I/O and CD DMA run at the stock rate too:
+// see cd_io_acc.
+localparam SND_RESET_SLOW = 24'd12000000;	// 250ms at 48MHz
+localparam SND_POLL_SLOW  = 24'd96000;		// 2ms
+localparam SND_POLL_GAP   = 15'd24000;		// 0.5ms
+localparam CD_REG_SLOW    = 24'd48000;		// 1ms
+localparam CD_IO_SLOW     = 24'd12000;		// 0.25ms
+
+wire snd_acc = ~nAS & ~nUDS & (M68K_ADDR[23:17] == 7'b0011_001);	// $320000-$33FFFF
+// Neo Geo CD, overclocked: only program execution runs fast. Any access that
+// is not work RAM ($000000-$1FFFFF) or the BIOS ($C00000-$CFFFFF), and any
+// time the bus is handed to the CD DMA, puts the 68000 at its stock rate,
+// until 0.25ms after the last such access.
+// v7: the BIOS itself ($C00000-$CFFFFF program fetches) also always runs at the
+// stock rate on the CD system; UniBIOS CD crashed within 0.5s of starting at
+// 24MHz on hardware (illegal instruction at $C00010). Games run from work RAM.
+wire cd_bios_run = SYSTEM_CDx & ~nAS & (M68K_ADDR[23:20] == 4'hC) & FC1 & ~FC0;
+wire cd_io_acc = SYSTEM_CDx & ((~nAS & (M68K_ADDR[23:21] != 3'd0) & (M68K_ADDR[23:20] != 4'hC)) | ~nBG | DMA_RUNNING) | cd_bios_run;
+reg  snd_acc_d = 0;
+reg  cd_acc_d = 0;
+reg  [23:0] snd_slow_cnt = 0;
+reg  [14:0] snd_poll_gap = 15'h7FFF;
+always @(posedge CLK_48M) begin
+	snd_acc_d <= snd_acc;
+	cd_acc_d  <= cd_reg_acc;
+	if (snd_slow_cnt != 0) snd_slow_cnt <= snd_slow_cnt - 24'd1;
+	if (snd_poll_gap != 15'h7FFF) snd_poll_gap <= snd_poll_gap + 15'd1;
+	if (!nRESET || !CPU_OVERCLOCK) begin
+		snd_slow_cnt <= 0;
+		snd_poll_gap <= 15'h7FFF;
+	end else if (snd_acc & ~snd_acc_d) begin
+		if (!M68K_RW) begin
+			if (FX68K_DATAOUT[15:8] == 8'h01 || FX68K_DATAOUT[15:8] == 8'h03)
+				snd_slow_cnt <= SND_RESET_SLOW;
+		end else begin
+			if (snd_poll_gap < SND_POLL_GAP && snd_slow_cnt < SND_POLL_SLOW)
+				snd_slow_cnt <= SND_POLL_SLOW;
+			snd_poll_gap <= 0;
+		end
+	end
+	else if (cd_reg_acc & ~cd_acc_d) begin
+		if (snd_slow_cnt < CD_REG_SLOW) snd_slow_cnt <= CD_REG_SLOW;
+	end
+	else if (cd_io_acc) begin
+		if (snd_slow_cnt < CD_IO_SLOW) snd_slow_cnt <= CD_IO_SLOW;
+	end
+end
+assign CPU_SLOW = (snd_slow_cnt != 0);
+
 // Because of the SDRAM latency, nDTACK is handled differently for ROM zones
 // If the address is in a ROM zone, PROM_DATA_READY is used to extend the normal nDTACK output by NEO-C1
-wire nDTACK_ADJ = ~&{nSROMOE, nROMOE, nPORTOE, ~CD_EXT_RD, ~CD_TR_RD_FIX, ~CD_TR_RD_SPR} ? ~PROM_DATA_READY | nDTACK
+wire nDTACK_ADJ0 = ~&{nSROMOE, nROMOE, nPORTOE, ~CD_EXT_RD, ~CD_TR_RD_FIX, ~CD_TR_RD_SPR} ? ~PROM_DATA_READY | nDTACK
                     : (CD_TR_WR_PCM) ? ~ddram_dtack | nDTACK
                     : (CD_TR_RD_PCM) ? ~ADPCMA_RD_DTACK | nDTACK
                     : nDTACK;
+// Neo Geo CD: a 68000 write to work RAM / FIX / sprite RAM goes to SDRAM when
+// the SDRAM is next free, reading the address and data off the 68000 bus at
+// that moment. At the stock rate the bus cycle lasts long enough; overclocked
+// it can end first, and the write lands at the next cycle's address with its
+// data (crashes on the CD logo). Hold DTACK until the write has started.
+wire cd_wr_wait = CPU_OVERCLOCK & CD_WR_PENDING;
+wire nDTACK_ADJ = nDTACK_ADJ0 | lspc_dtack_wait | cd_dtack_wait | cd_wr_wait;	// LSPC / CD pacing, only when overclocked
 
 cpu_68k M68KCPU(
 	.CLK(CLK_48M),
-	.CLK_EN_68K_P(CLK_EN_68K_P),
-	.CLK_EN_68K_N(CLK_EN_68K_N),
+	.CLK_EN_68K_P(CPU_EN_P),
+	.CLK_EN_68K_N(CPU_EN_N),
 	.nRESET(nRESET),
 	.M68K_ADDR(M68K_ADDR),
 	.FX68K_DATAIN(FX68K_DATAIN), .FX68K_DATAOUT(FX68K_DATAOUT),
@@ -1418,7 +1621,7 @@ assign M68K_DATA = (cart_chip == 2) ? COM_DOUT : 16'bzzzzzzzz_zzzzzzzz;
 syslatch SL(
 	.nRESET(nRESET),
 	.CLK(CLK_48M),
-	.CLK_EN_68K_P(CLK_EN_68K_P),
+	.CLK_EN_68K_P(CPU_EN_P),
 	.M68K_ADDR(M68K_ADDR[4:1]),
 	.nBITW1(nBITW1),
 	.SHADOW(SHADOW), .nVEC(nVEC), .nCARDWEN(nCARDWEN),	.CARDWENB(CARDWENB), .nREGEN(nREGEN), .nSYSTEM(nSYSTEM), .nSRAMWEN(nSRAMWEN), .PALBNK(PALBNK)
@@ -1499,7 +1702,7 @@ neo_c1 C1(
 	.SDD_WR(SDD_OUT),
 	.SDD_RD(SDD_RD_C1),
 	.nSDZ80R(nSDZ80R), .nSDZ80W(nSDZ80W), .nSDZ80CLR(nSDZ80CLR),
-	.CLK_EN_68K_P(CLK_EN_68K_P),
+	.CLK_EN_68K_P(CPU_EN_P),	// NEO-C1 wait states count CPU clocks
 	.nDTACK(nDTACK),
 	.nBITW0(nBITW0), .nBITW1(nBITW1),
 	.nDIPRD0(nDIPRD0), .nDIPRD1(nDIPRD1),
@@ -1565,11 +1768,13 @@ zmc2_dot ZMC2(
 	.DOTA(DOTA), .DOTB(DOTB)
 );
 
+// port A: ROM loading, and the extra sprite renderer (neo_xspr) the rest of the time
 dpram #(16) LO(
 	.clock_a(clk_sys),
-	.address_a(ioctl_addr[16:1]),
+	.address_a((ioctl_download & (ioctl_index == INDEX_LOROM)) ? ioctl_addr[16:1] : XLO_ADDR),
 	.data_a(ioctl_dout[7:0]),
 	.wren_a(ioctl_download & (ioctl_index == INDEX_LOROM) & ioctl_wr),
+	.q_a(XLO_Q),
 	.clock_b(CLK_48M),
 	.address_b(PBUS[15:0]),
 	.q_b(LO_ROM_DATA)
@@ -1581,20 +1786,30 @@ dpram #(16) LO(
 // half mclk cycle it provides compared to VCS. This makes sure LO_ROM_DATA is valid when latched.
 assign PBUS[23:16] = nPBUS_OUT_EN ? LO_ROM_DATA : 8'bzzzzzzzz;
 
-spram #(11,16) UFV(
-	.clock(CLK_48M),
-	.address(FAST_VRAM_ADDR),
-	.data(FAST_VRAM_DATA_OUT),
-	.wren(~CWE),
-	.q(FAST_VRAM_DATA_IN)
+// VRAMs: port B is read by the extra sprite renderer (neo_xspr)
+
+dpram #(11,16) UFV(
+	.clock_a(CLK_48M),
+	.address_a(FAST_VRAM_ADDR),
+	.data_a(FAST_VRAM_DATA_OUT),
+	.wren_a(~CWE),
+	.q_a(FAST_VRAM_DATA_IN),
+	.clock_b(CLK_48M),
+	.address_b(XFV_ADDR),
+	.wren_b(1'b0),
+	.q_b(XFV_Q)
 );
 
-spram #(15,16) USV(
-	.clock(CLK_48M),
-	.address(SLOW_VRAM_ADDR),
-	.data(SLOW_VRAM_DATA_OUT),
-	.wren(~BWE),
-	.q(SLOW_VRAM_DATA_IN)
+dpram #(15,16) USV(
+	.clock_a(CLK_48M),
+	.address_a(SLOW_VRAM_ADDR),
+	.data_a(SLOW_VRAM_DATA_OUT),
+	.wren_a(~BWE),
+	.q_a(SLOW_VRAM_DATA_IN),
+	.clock_b(CLK_48M),
+	.address_b(XSV_ADDR),
+	.wren_b(1'b0),
+	.q_b(XSV_Q)
 );
 
 wire [18:11] MA;
@@ -1955,7 +2170,7 @@ lspc2_a2_sync	LSPC(
 	.IPL0(IPL0), .IPL1(IPL1),
 	.CD_VBLANK_IRQ_EN(CD_VBLANK_IRQ_EN | ~SYSTEM_CDx),
 	.CD_TIMER_IRQ_EN(CD_TIMER_IRQ_EN | ~SYSTEM_CDx),
-	.LSPOE(nLSPOE), .LSPWE(nLSPWE),
+	.LSPOE(nLSPOE | lspc_hold), .LSPWE(nLSPWE | lspc_hold),
 	.PBUS_OUT(PBUS[15:0]), .PBUS_IO(PBUS[23:16]),
 	.nPBUS_OUT_EN(nPBUS_OUT_EN),
 	.DOTA(DOTA_GATED), .DOTB(DOTB_GATED),
@@ -1977,7 +2192,11 @@ lspc2_a2_sync	LSPC(
 	.FVRAM_DATA_IN(FAST_VRAM_DATA_IN), .FVRAM_DATA_OUT(FAST_VRAM_DATA_OUT),
 	.CWE(CWE),
 	.VMODE(video_mode),
-	.FIXMAP_ADDR(FIXMAP_ADDR)	// Extracted for NEO-CMC
+	.FIXMAP_ADDR(FIXMAP_ADDR),	// Extracted for NEO-CMC
+	.CPU_VRAM_BUSY(LSPC_VRAM_BUSY),
+	.CPU_VRAM_WR_BUSY(LSPC_VRAM_WR_BUSY),
+	.XSPR_RASTERC(XSPR_RASTERC), .XSPR_PIXELC(XSPR_PIXELC),
+	.XSPR_AA_COUNT(XSPR_AA_COUNT), .XSPR_AA_DISABLE(XSPR_AA_DISABLE)
 );
 
 wire DOGE = SYSTEM_CDx ? ~CD_UPLOAD_EN : 1'b1; // UPLOAD_EN disables Watchdog?
@@ -1999,7 +2218,9 @@ neo_b1 B1(
 	.EN_FIX(FIX_EN),
 	.DOGE(DOGE),
 	.nRST(nRESET_CORE),
-	.nRESET(nRESET)
+	.nRESET(nRESET),
+	.XSPR_PIXEL(XSPR_PIXEL),
+	.XSPR_OPAQUE(XSPR_OPAQUE)
 );
 
 spram #(13,16) PALRAM(
@@ -2059,6 +2280,27 @@ always @(posedge CLK_VIDEO) begin
 		RFSH <= (vblcnt < rfsh_cnt);
 	end
 end
+
+// Extra sprite renderer: draws the sprites after the 96th on each line
+// (OSD "Sprites per Line: No Limit"). Off, the core is unchanged.
+wire xspr_opaque_raw;
+neo_xspr XSPR(
+	.CLK(CLK_48M),
+	.nRESET(nRESET),
+	.ENABLE(status[47] & ~(ioctl_download & ioctl_en)),	// off while ROMs are written to SDRAM
+	.SKIP(9'd96),
+	.RASTERC(XSPR_RASTERC), .PIXELC(XSPR_PIXELC),
+	.AA_COUNT(XSPR_AA_COUNT), .AA_DISABLE(XSPR_AA_DISABLE),
+	.FV_ADDR(XFV_ADDR), .FV_Q(XFV_Q),
+	.SV_ADDR(XSV_ADDR), .SV_Q(XSV_Q),
+	.LO_ADDR(XLO_ADDR), .LO_Q(XLO_Q),
+	.CROM_MASK(CROM_MASK),
+	.CROM_BASE(SYSTEM_CDx ? 7'd8 : CROM_START),
+	.SDRAM_OK(SPR_EN & ~CD_USE_SPR & ~RFSH),
+	.XS_REQ(XS_REQ), .XS_ADDR(XS_ADDR), .XS_ACK(XS_ACK), .XS_DATA(XS_DATA),
+	.PIXEL(XSPR_PIXEL), .OPAQUE(xspr_opaque_raw)
+);
+assign XSPR_OPAQUE = xspr_opaque_raw & SPR_EN;
 
 assign VGA_SL = scale ? scale[1:0] - 1'd1 : 2'd0;
 assign VGA_F1 = 0;

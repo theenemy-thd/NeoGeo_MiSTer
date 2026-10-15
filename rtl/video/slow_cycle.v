@@ -70,7 +70,8 @@ module slow_cycle_sync(
 	
 	output [14:0] FIXMAP_ADDR,		// Extracted for NEO-CMC
 	output [14:0] SPRMAP_ADDR,
-	output [1:0] VRAM_CYCLE         // Hint to SDRAM controller (10 - Sprite map read, 01 - CPU R/W, 00 - fixmap read)
+	output [1:0] VRAM_CYCLE,         // Hint to SDRAM controller (10 - Sprite map read, 01 - CPU R/W, 00 - fixmap read)
+	output CPU_READ_LOW_UPD         // CPU read latch loaded (used by the 68K overclock)
 );
 
 	wire [14:0] B;
@@ -201,5 +202,7 @@ module slow_cycle_sync(
 	
 	//vram_slow_u VRAMLU(B, E[15:8], 1'b0, BOE, BWE);
 	//vram_slow_l VRAMLL(B, E[7:0], 1'b0, BOE, BWE);
+
+	assign CPU_READ_LOW_UPD = CLK_CPU_READ_LOW_EN;
 
 endmodule

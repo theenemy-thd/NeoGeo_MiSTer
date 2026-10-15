@@ -13,3 +13,4 @@ set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) hshrink
 set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) fast_cycle.v ]
 set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) autoanim.v ]
 set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) neo_cmc.v ]
+set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) neo_xspr.v ]

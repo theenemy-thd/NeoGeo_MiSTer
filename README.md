@@ -1,3 +1,5 @@
+> **TREX branch:** this is a modified test build (68K overclock, no sprite limit, DB15 user port). See [README_TREX.md](README_TREX.md). Main core: [MiSTer-devel/NeoGeo_MiSTer](https://github.com/MiSTer-devel/NeoGeo_MiSTer).
+
 
 # [SNK Neo Geo](https://en.wikipedia.org/wiki/Neo_Geo_(system)) for [MiSTer Platform](https://github.com/MiSTer-devel/Main_MiSTer/wiki) 
 

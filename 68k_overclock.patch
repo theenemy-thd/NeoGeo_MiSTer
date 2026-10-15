@@ -1,0 +1,1250 @@
+diff --git a/files.qip b/files.qip
+index c1928b6..c1f8e21 100644
+--- a/files.qip
++++ b/files.qip
+@@ -10,5 +10,6 @@ set_global_assignment -name QIP_FILE rtl/cpu/FX68K/fx68k.qip
+ set_global_assignment -name QIP_FILE rtl/cpu/T80/T80.qip
+ set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_z80.v
+ set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_68k.v
++set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_speed.v
+ set_global_assignment -name SYSTEMVERILOG_FILE neogeo.sv
+ set_global_assignment -name SDC_FILE NeoGeo.sdc
+diff --git a/neogeo.sv b/neogeo.sv
+index c237adc..8a44a52 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -38,7 +38,7 @@
+ 
+ module emu
+ (
+-	`include "sys/emu_ports.vh"
++	`include "sys/emu_ports.vh"
+ );
+ 
+ assign ADC_BUS  = 'Z;
+@@ -113,7 +113,7 @@ video_freak video_freak
+ // 0         1         2         3          4         5         6   
+ // 01234567890123456789012345678901 23456789012345678901234567890123
+ // 0123456789ABCDEFGHIJKLMNOPQRSTUV 0123456789ABCDEFGHIJKLMNOPQRSTUV
+-// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXX            XXXXXX 
++// XXXXXXXXXXXXX XXX XXXXX XXXXXXX  XXXXXXXXXXXXXXXX         XXXXXX 
+ 
+ `include "build_id.v"
+ localparam CONF_STR = {
+@@ -136,6 +136,9 @@ localparam CONF_STR = {
+ 	"O1,System Type,Console(AES),Arcade(MVS);",
+ 	"OM,BIOS,UniBIOS,Original;",
+ 	"O3,Video Mode,NTSC,PAL;",
++	"oDE,68K Speed,12MHz,18MHz,24MHz;",
++	"oF,Sprites per Line,96 (Original),No Limit;",
++	"oG,Cart Wait States,Original,Off;",
+ 	"-;",
+ 	"o9A,Input,Joystick or Spinner,Joystick,Spinner,Mouse(Irr.Maze);",
+ 	"oBC,Multitap,No,NEO-FTC1B,NeoTris;",
+@@ -415,6 +418,27 @@ wire CD_nRESET_Z80;
+ // Clocks
+ wire CLK_EN_12M, CLK_EN_12M_N, CLK_68KCLK, CLK_68KCLKB, CLK_EN_6MB, CLK_EN_1HB, CLK_EN_4M_P, CLK_EN_4M_N, CLK_EN_68K_P, CLK_EN_68K_N;
+ 
++// 68000 overclock (OSD "68K Speed"): 12MHz (original), 18MHz or 24MHz
++// Only the CPU and the logic that follows its bus cycles (NEO-C1 wait states,
++// system latch) use the faster enables. Video, sound, Z80, timers and the CD
++// interface keep the original clocks. The speed is taken while the CPU is in
++// reset, so a change applies on "Reset & apply" and never mid bus cycle.
++wire CPU_EN_P, CPU_EN_N, CPU_OVERCLOCK;
++wire CPU_SLOW;	// 68000 back to the stock rate for now (see sound sync below)
++
++cpu_speed CPU_SPEED(
++	.CLK(CLK_48M),
++	.nRESET(nRESET),
++	.SPEED(status[46:45]),
++	.SLOW(CPU_SLOW),
++	.CLK_EN_68K_P(CLK_EN_68K_P),
++	.CLK_EN_68K_N(CLK_EN_68K_N),
++	.CPU_EN_P(CPU_EN_P),
++	.CPU_EN_N(CPU_EN_N),
++	.OVERCLOCK(CPU_OVERCLOCK)
++);
++
++
+ // 68k stuff
+ wire [15:0] M68K_DATA;
+ wire [23:1] M68K_ADDR;
+@@ -437,6 +461,32 @@ wire nPORTOEL, nPORTOEU, nPORTWEL, nPORTWEU, nPORTADRS;
+ wire nSRAMOEL, nSRAMOEU, nSRAMWEL, nSRAMWEU;
+ wire nWRL, nWRU, nWWL, nWWU;
+ wire nLSPOE, nLSPWE;
++
++// LSPC VRAM access pacing for the overclocked 68000
++// The LSPC takes CPU VRAM writes and reads in its own time slots. At 12MHz the
++// 68000 can't get ahead of it, but at 18/24MHz it would overwrite a pending
++// write or read a stale latch. When the CPU accesses the VRAM registers
++// ($3C0000/2/4) while the LSPC is still busy with the previous access, the
++// access is held back (LSPC strobes and DTACK) until the LSPC is free. Then it
++// goes through once, and DTACK waits 3 more clocks so read data is valid.
++wire LSPC_VRAM_BUSY, LSPC_VRAM_WR_BUSY;
++wire lspc_vram_acc = (~nLSPWE & (M68K_ADDR[3:1] <= 3'd2)) | (~nLSPOE & ~M68K_ADDR[2]);
++reg  lspc_granted = 0, lspc_waited = 0;
++reg  [1:0] lspc_dly = 0;
++wire lspc_hold = CPU_OVERCLOCK & lspc_vram_acc & ~lspc_granted & (~nLSPWE ? LSPC_VRAM_WR_BUSY : LSPC_VRAM_BUSY);
++wire lspc_dtack_wait = lspc_hold | (lspc_waited & (lspc_dly != 2'd3));
++
++always @(posedge CLK_48M) begin
++	if (!lspc_vram_acc) begin
++		lspc_granted <= 0;
++		lspc_waited  <= 0;
++		lspc_dly     <= 0;
++	end else begin
++		if (lspc_hold) lspc_waited  <= 1;
++		else           lspc_granted <= 1;
++		if (lspc_granted && lspc_dly != 2'd3) lspc_dly <= lspc_dly + 2'd1;
++	end
++end
+ wire nPAL, nPAL_WE;
+ wire nBITW0, nBITW1, nBITWD0, nDIPRD0, nDIPRD1;
+ wire nSDROE, nSDPOE;
+@@ -538,8 +588,13 @@ wire [2:0] cart_pchip = cfg[22:20];
+ wire       use_pcm    = cfg[23];
+ wire [1:0] cart_chip  = cfg[25:24]; // legacy option: 0 - none, 1 - PRO-CT0, 2 - Link MCU
+ wire [1:0] cmc_chip   = cfg[27:26]; // type 1/2
+-wire       rom_wait   = cfg[28];    // ROMWAIT from cart. 0 - Full speed, 1 - 1 wait cycle
+-wire [1:0] p_wait     = cfg[30:29]; // PWAIT from cart. 0 - Full speed, 1 - 1 wait cycle, 2 - 2 cycles
++// OSD "Cart Wait States: Off" (status[48]) drops the cart's ROM/port wait
++// states. Only a few carts set them (Ninja Combat, Ninja Commando, KOF94:
++// ROMWAIT; KOF94-2001, Fatal Fury 3, Real Bout 2: PWAIT). The ROM is in SDRAM,
++// and nDTACK still waits for PROM_DATA_READY, so reads stay correct.
++wire       no_cart_wait = status[48];
++wire       rom_wait   = cfg[28] & ~no_cart_wait;           // ROMWAIT from cart. 0 - Full speed, 1 - 1 wait cycle
++wire [1:0] p_wait     = cfg[30:29] & {2{~no_cart_wait}};   // PWAIT from cart. 0 - Full speed, 1 - 1 wait cycle, 2 - 2 cycles
+ wire       cd_en      = cfg[31];    // Neo CD
+ 
+ // Memory card and backup ram image save/load
+@@ -761,11 +816,36 @@ wire CD_DATA_WR = ioctl_wr_x & CD_DATA_DOWNLOAD;
+ wire CDDA_DOWNLOAD = ioctl_download & (ioctl_index[5:0] == 6'h04);
+ wire CDDA_WR = ioctl_wr_x & CDDA_DOWNLOAD;
+ 
++// CD register pacing for the overclocked 68000
++// The CD registers ($FF0000-$FF0FFF) look for 68000 strobe edges at the stock
++// 12MHz rate. A faster 68000 can start and end a whole access (or go straight
++// from one access to the next) between two of those samples. When overclocked,
++// the CD system sees the strobes of such an access only after one 12MHz sample
++// has seen them inactive, and DTACK waits until two more samples have seen them
++// active, so every access is seen exactly once, as at 12MHz.
++wire cd_reg_acc = SYSTEM_CDx & ~nAS & (M68K_ADDR[23:12] == 12'hFF0);
++reg  cd_reg_armed = 0;
++reg  [1:0] cd_reg_cnt = 0;
++always @(posedge CLK_48M) begin
++	if (!cd_reg_acc) begin
++		cd_reg_armed <= 0;
++		cd_reg_cnt   <= 0;
++	end else if (CLK_EN_68K_P) begin
++		cd_reg_armed <= 1;
++		if (cd_reg_armed && cd_reg_cnt != 2'd3) cd_reg_cnt <= cd_reg_cnt + 2'd1;
++	end
++end
++wire cd_reg_mask = CPU_OVERCLOCK & cd_reg_acc & ~cd_reg_armed;
++wire cd_dtack_wait = CPU_OVERCLOCK & cd_reg_acc & (cd_reg_cnt < 2'd2);
++wire cd_nAS  = nAS  | cd_reg_mask;
++wire cd_nLDS = nLDS | cd_reg_mask;
++wire cd_nUDS = nUDS | cd_reg_mask;
++
+ cd_sys #(.MCLK(CD_MCLK)) cdsystem(
+ 	.nRESET(nRESET),
+ 	.clk_sys(CLK_48M), .CLK_68KCLK_EN(CLK_EN_68K_P),
+ 	.M68K_ADDR(M68K_ADDR), .M68K_DATA(M68K_DATA), .A22Z(A22Z), .A23Z(A23Z),
+-	.nLDS(nLDS), .nUDS(nUDS), .M68K_RW(M68K_RW), .nAS(nAS), .nDTACK(nDTACK_ADJ),
++	.nLDS(cd_nLDS), .nUDS(cd_nUDS), .M68K_RW(M68K_RW), .nAS(cd_nAS), .nDTACK(nDTACK_ADJ),
+ 	.nBR(nBR), .nBG(nBG), .nBGACK(nBGACK),
+ 	.SYSTEM_CDx(SYSTEM_CDx),
+ 	.CD_REGION(CD_REGION),
+@@ -814,6 +894,7 @@ wire nPORTOE = nPORTOEL & nPORTOEU;
+ wire CD_EXT_RD = DMA_RUNNING ? (SYSTEM_CDx & (DMA_ADDR_IN[23:21] == 3'd0) & DMA_RD_OUT) :		// DMA reads from $000000~$1FFFFF
+ 										 (SYSTEM_CDx & (~nWRL | ~nWRU));											// CPU reads from $100000~$1FFFFF
+ 
++wire        CD_WR_PENDING;
+ wire        sdram_ready;
+ wire [26:1] sdram_addr;
+ wire [15:0] sdram_dout;
+@@ -930,6 +1011,22 @@ always @(posedge CLK_96M) begin
+ 	ioctl_wr_rd1 <= ioctl_wr_rd;
+ end
+ 
++// extra sprite renderer (neo_xspr) <-> SDRAM mux, VRAM/LO ROM ports, LSPC, B1
++wire        XS_REQ, XS_ACK;
++wire [26:0] XS_ADDR;
++wire [63:0] XS_DATA;
++wire [10:0] XFV_ADDR;
++wire [15:0] XFV_Q;
++wire [14:0] XSV_ADDR;
++wire [15:0] XSV_Q;
++wire [15:0] XLO_ADDR;
++wire  [7:0] XLO_Q;
++wire  [8:0] XSPR_RASTERC, XSPR_PIXELC;
++wire  [2:0] XSPR_AA_COUNT;
++wire        XSPR_AA_DISABLE;
++wire [11:0] XSPR_PIXEL;
++wire        XSPR_OPAQUE;
++
+ wire SDRAM_WR;
+ wire SDRAM_RD;
+ wire SDRAM_RFSH;
+@@ -954,6 +1051,7 @@ sdram_mux SDRAM_MUX(
+ 	.P2ROM_ADDR(P2ROM_ADDR & P2ROM_MASK),
+ 	.PROM_DATA(PROM_DATA),
+ 	.PROM_DATA_READY(PROM_DATA_READY),
++	.CD_WR_PENDING(CD_WR_PENDING),
+ 
+ 	.CD_TR_AREA(CD_TR_AREA),
+ 	.CD_EXT_WR(CD_EXT_WR),
+@@ -991,6 +1089,11 @@ sdram_mux SDRAM_MUX(
+ 
+ 	.REFRESH_EN(RFSH),
+ 
++	.XS_REQ(XS_REQ),
++	.XS_ADDR(XS_ADDR),
++	.XS_ACK(XS_ACK),
++	.XS_DATA(XS_DATA),
++
+ 	.SDRAM_ADDR(sdram_addr),
+ 	.SDRAM_DOUT(sdram_dout),
+ 	.SDRAM_DIN(sdram_din),
+@@ -1126,17 +1229,91 @@ wire [1:0] CD_IPL = {IPL1,IPL0} == 2'b01 ? 2'b00     // Level 3 Timer
+ 
+ wire [1:0] IPL_OUT = ~SYSTEM_CDx ? { IPL1,IPL0 } : CD_IPL;
+ 
++// Sound CPU sync for the overclocked 68000
++// Games time some of their talks with the Z80 with CPU loops written for 12MHz:
++// after sending $01 (prepare for slot switch) or $03 (Z80 soft reset) they
++// wait a fixed number of loops for the Z80 to be ready, and they poll
++// REG_SOUND for replies with loop-count timeouts. Overclocked, those waits end
++// too early and the next sound commands are lost (no music, or no sound at
++// all). So the 68000 briefly goes back to its stock rate:
++// - for 250ms after writing $01 or $03 to REG_SOUND (SNK asks for the Z80
++//   reset to take under 100ms, so stock-timed waits fit in that),
++// - while the 68000 keeps reading REG_SOUND (reads less than 0.5ms apart),
++//   and for 2ms after the last of them.
++// A single read or write of REG_SOUND per frame doesn't slow anything down.
++// Neo Geo CD: the BIOS talks to the CD drive (a slow MCU, emulated at 250kHz)
++// through a 4-bit handshake in the CD registers, with loop-count timeouts in
++// its polling. At 24MHz those time out and the BIOS never gets past its boot
++// screen. So any CD register access ($FF0000-$FF0FFF) also puts the 68000 at
++// its stock rate, for 1ms after the last one (the drive exchange happens 64
++// times a second and takes about 0.3ms).
++// On top of that (v6), all other CD I/O and CD DMA run at the stock rate too:
++// see cd_io_acc.
++localparam SND_RESET_SLOW = 24'd12000000;	// 250ms at 48MHz
++localparam SND_POLL_SLOW  = 24'd96000;		// 2ms
++localparam SND_POLL_GAP   = 15'd24000;		// 0.5ms
++localparam CD_REG_SLOW    = 24'd48000;		// 1ms
++localparam CD_IO_SLOW     = 24'd12000;		// 0.25ms
++
++wire snd_acc = ~nAS & ~nUDS & (M68K_ADDR[23:17] == 7'b0011_001);	// $320000-$33FFFF
++// Neo Geo CD, overclocked: only program execution runs fast. Any access that
++// is not work RAM ($000000-$1FFFFF) or the BIOS ($C00000-$CFFFFF), and any
++// time the bus is handed to the CD DMA, puts the 68000 at its stock rate,
++// until 0.25ms after the last such access.
++// v7: the BIOS itself ($C00000-$CFFFFF program fetches) also always runs at the
++// stock rate on the CD system; UniBIOS CD crashed within 0.5s of starting at
++// 24MHz on hardware (illegal instruction at $C00010). Games run from work RAM.
++wire cd_bios_run = SYSTEM_CDx & ~nAS & (M68K_ADDR[23:20] == 4'hC) & FC1 & ~FC0;
++wire cd_io_acc = SYSTEM_CDx & ((~nAS & (M68K_ADDR[23:21] != 3'd0) & (M68K_ADDR[23:20] != 4'hC)) | ~nBG | DMA_RUNNING) | cd_bios_run;
++reg  snd_acc_d = 0;
++reg  cd_acc_d = 0;
++reg  [23:0] snd_slow_cnt = 0;
++reg  [14:0] snd_poll_gap = 15'h7FFF;
++always @(posedge CLK_48M) begin
++	snd_acc_d <= snd_acc;
++	cd_acc_d  <= cd_reg_acc;
++	if (snd_slow_cnt != 0) snd_slow_cnt <= snd_slow_cnt - 24'd1;
++	if (snd_poll_gap != 15'h7FFF) snd_poll_gap <= snd_poll_gap + 15'd1;
++	if (!nRESET || !CPU_OVERCLOCK) begin
++		snd_slow_cnt <= 0;
++		snd_poll_gap <= 15'h7FFF;
++	end else if (snd_acc & ~snd_acc_d) begin
++		if (!M68K_RW) begin
++			if (FX68K_DATAOUT[15:8] == 8'h01 || FX68K_DATAOUT[15:8] == 8'h03)
++				snd_slow_cnt <= SND_RESET_SLOW;
++		end else begin
++			if (snd_poll_gap < SND_POLL_GAP && snd_slow_cnt < SND_POLL_SLOW)
++				snd_slow_cnt <= SND_POLL_SLOW;
++			snd_poll_gap <= 0;
++		end
++	end
++	else if (cd_reg_acc & ~cd_acc_d) begin
++		if (snd_slow_cnt < CD_REG_SLOW) snd_slow_cnt <= CD_REG_SLOW;
++	end
++	else if (cd_io_acc) begin
++		if (snd_slow_cnt < CD_IO_SLOW) snd_slow_cnt <= CD_IO_SLOW;
++	end
++end
++assign CPU_SLOW = (snd_slow_cnt != 0);
++
+ // Because of the SDRAM latency, nDTACK is handled differently for ROM zones
+ // If the address is in a ROM zone, PROM_DATA_READY is used to extend the normal nDTACK output by NEO-C1
+-wire nDTACK_ADJ = ~&{nSROMOE, nROMOE, nPORTOE, ~CD_EXT_RD, ~CD_TR_RD_FIX, ~CD_TR_RD_SPR} ? ~PROM_DATA_READY | nDTACK
++wire nDTACK_ADJ0 = ~&{nSROMOE, nROMOE, nPORTOE, ~CD_EXT_RD, ~CD_TR_RD_FIX, ~CD_TR_RD_SPR} ? ~PROM_DATA_READY | nDTACK
+                     : (CD_TR_WR_PCM) ? ~ddram_dtack | nDTACK
+                     : (CD_TR_RD_PCM) ? ~ADPCMA_RD_DTACK | nDTACK
+                     : nDTACK;
++// Neo Geo CD: a 68000 write to work RAM / FIX / sprite RAM goes to SDRAM when
++// the SDRAM is next free, reading the address and data off the 68000 bus at
++// that moment. At the stock rate the bus cycle lasts long enough; overclocked
++// it can end first, and the write lands at the next cycle's address with its
++// data (crashes on the CD logo). Hold DTACK until the write has started.
++wire cd_wr_wait = CPU_OVERCLOCK & CD_WR_PENDING;
++wire nDTACK_ADJ = nDTACK_ADJ0 | lspc_dtack_wait | cd_dtack_wait | cd_wr_wait;	// LSPC / CD pacing, only when overclocked
+ 
+ cpu_68k M68KCPU(
+ 	.CLK(CLK_48M),
+-	.CLK_EN_68K_P(CLK_EN_68K_P),
+-	.CLK_EN_68K_N(CLK_EN_68K_N),
++	.CLK_EN_68K_P(CPU_EN_P),
++	.CLK_EN_68K_N(CPU_EN_N),
+ 	.nRESET(nRESET),
+ 	.M68K_ADDR(M68K_ADDR),
+ 	.FX68K_DATAIN(FX68K_DATAIN), .FX68K_DATAOUT(FX68K_DATAOUT),
+@@ -1418,7 +1595,7 @@ assign M68K_DATA = (cart_chip == 2) ? COM_DOUT : 16'bzzzzzzzz_zzzzzzzz;
+ syslatch SL(
+ 	.nRESET(nRESET),
+ 	.CLK(CLK_48M),
+-	.CLK_EN_68K_P(CLK_EN_68K_P),
++	.CLK_EN_68K_P(CPU_EN_P),
+ 	.M68K_ADDR(M68K_ADDR[4:1]),
+ 	.nBITW1(nBITW1),
+ 	.SHADOW(SHADOW), .nVEC(nVEC), .nCARDWEN(nCARDWEN),	.CARDWENB(CARDWENB), .nREGEN(nREGEN), .nSYSTEM(nSYSTEM), .nSRAMWEN(nSRAMWEN), .PALBNK(PALBNK)
+@@ -1499,7 +1676,7 @@ neo_c1 C1(
+ 	.SDD_WR(SDD_OUT),
+ 	.SDD_RD(SDD_RD_C1),
+ 	.nSDZ80R(nSDZ80R), .nSDZ80W(nSDZ80W), .nSDZ80CLR(nSDZ80CLR),
+-	.CLK_EN_68K_P(CLK_EN_68K_P),
++	.CLK_EN_68K_P(CPU_EN_P),	// NEO-C1 wait states count CPU clocks
+ 	.nDTACK(nDTACK),
+ 	.nBITW0(nBITW0), .nBITW1(nBITW1),
+ 	.nDIPRD0(nDIPRD0), .nDIPRD1(nDIPRD1),
+@@ -1565,11 +1742,13 @@ zmc2_dot ZMC2(
+ 	.DOTA(DOTA), .DOTB(DOTB)
+ );
+ 
++// port A: ROM loading, and the extra sprite renderer (neo_xspr) the rest of the time
+ dpram #(16) LO(
+ 	.clock_a(clk_sys),
+-	.address_a(ioctl_addr[16:1]),
++	.address_a((ioctl_download & (ioctl_index == INDEX_LOROM)) ? ioctl_addr[16:1] : XLO_ADDR),
+ 	.data_a(ioctl_dout[7:0]),
+ 	.wren_a(ioctl_download & (ioctl_index == INDEX_LOROM) & ioctl_wr),
++	.q_a(XLO_Q),
+ 	.clock_b(CLK_48M),
+ 	.address_b(PBUS[15:0]),
+ 	.q_b(LO_ROM_DATA)
+@@ -1581,20 +1760,30 @@ dpram #(16) LO(
+ // half mclk cycle it provides compared to VCS. This makes sure LO_ROM_DATA is valid when latched.
+ assign PBUS[23:16] = nPBUS_OUT_EN ? LO_ROM_DATA : 8'bzzzzzzzz;
+ 
+-spram #(11,16) UFV(
+-	.clock(CLK_48M),
+-	.address(FAST_VRAM_ADDR),
+-	.data(FAST_VRAM_DATA_OUT),
+-	.wren(~CWE),
+-	.q(FAST_VRAM_DATA_IN)
++// VRAMs: port B is read by the extra sprite renderer (neo_xspr)
++
++dpram #(11,16) UFV(
++	.clock_a(CLK_48M),
++	.address_a(FAST_VRAM_ADDR),
++	.data_a(FAST_VRAM_DATA_OUT),
++	.wren_a(~CWE),
++	.q_a(FAST_VRAM_DATA_IN),
++	.clock_b(CLK_48M),
++	.address_b(XFV_ADDR),
++	.wren_b(1'b0),
++	.q_b(XFV_Q)
+ );
+ 
+-spram #(15,16) USV(
+-	.clock(CLK_48M),
+-	.address(SLOW_VRAM_ADDR),
+-	.data(SLOW_VRAM_DATA_OUT),
+-	.wren(~BWE),
+-	.q(SLOW_VRAM_DATA_IN)
++dpram #(15,16) USV(
++	.clock_a(CLK_48M),
++	.address_a(SLOW_VRAM_ADDR),
++	.data_a(SLOW_VRAM_DATA_OUT),
++	.wren_a(~BWE),
++	.q_a(SLOW_VRAM_DATA_IN),
++	.clock_b(CLK_48M),
++	.address_b(XSV_ADDR),
++	.wren_b(1'b0),
++	.q_b(XSV_Q)
+ );
+ 
+ wire [18:11] MA;
+@@ -1955,7 +2144,7 @@ lspc2_a2_sync	LSPC(
+ 	.IPL0(IPL0), .IPL1(IPL1),
+ 	.CD_VBLANK_IRQ_EN(CD_VBLANK_IRQ_EN | ~SYSTEM_CDx),
+ 	.CD_TIMER_IRQ_EN(CD_TIMER_IRQ_EN | ~SYSTEM_CDx),
+-	.LSPOE(nLSPOE), .LSPWE(nLSPWE),
++	.LSPOE(nLSPOE | lspc_hold), .LSPWE(nLSPWE | lspc_hold),
+ 	.PBUS_OUT(PBUS[15:0]), .PBUS_IO(PBUS[23:16]),
+ 	.nPBUS_OUT_EN(nPBUS_OUT_EN),
+ 	.DOTA(DOTA_GATED), .DOTB(DOTB_GATED),
+@@ -1977,7 +2166,11 @@ lspc2_a2_sync	LSPC(
+ 	.FVRAM_DATA_IN(FAST_VRAM_DATA_IN), .FVRAM_DATA_OUT(FAST_VRAM_DATA_OUT),
+ 	.CWE(CWE),
+ 	.VMODE(video_mode),
+-	.FIXMAP_ADDR(FIXMAP_ADDR)	// Extracted for NEO-CMC
++	.FIXMAP_ADDR(FIXMAP_ADDR),	// Extracted for NEO-CMC
++	.CPU_VRAM_BUSY(LSPC_VRAM_BUSY),
++	.CPU_VRAM_WR_BUSY(LSPC_VRAM_WR_BUSY),
++	.XSPR_RASTERC(XSPR_RASTERC), .XSPR_PIXELC(XSPR_PIXELC),
++	.XSPR_AA_COUNT(XSPR_AA_COUNT), .XSPR_AA_DISABLE(XSPR_AA_DISABLE)
+ );
+ 
+ wire DOGE = SYSTEM_CDx ? ~CD_UPLOAD_EN : 1'b1; // UPLOAD_EN disables Watchdog?
+@@ -1999,7 +2192,9 @@ neo_b1 B1(
+ 	.EN_FIX(FIX_EN),
+ 	.DOGE(DOGE),
+ 	.nRST(nRESET_CORE),
+-	.nRESET(nRESET)
++	.nRESET(nRESET),
++	.XSPR_PIXEL(XSPR_PIXEL),
++	.XSPR_OPAQUE(XSPR_OPAQUE)
+ );
+ 
+ spram #(13,16) PALRAM(
+@@ -2060,6 +2255,27 @@ always @(posedge CLK_VIDEO) begin
+ 	end
+ end
+ 
++// Extra sprite renderer: draws the sprites after the 96th on each line
++// (OSD "Sprites per Line: No Limit"). Off, the core is unchanged.
++wire xspr_opaque_raw;
++neo_xspr XSPR(
++	.CLK(CLK_48M),
++	.nRESET(nRESET),
++	.ENABLE(status[47] & ~(ioctl_download & ioctl_en)),	// off while ROMs are written to SDRAM
++	.SKIP(9'd96),
++	.RASTERC(XSPR_RASTERC), .PIXELC(XSPR_PIXELC),
++	.AA_COUNT(XSPR_AA_COUNT), .AA_DISABLE(XSPR_AA_DISABLE),
++	.FV_ADDR(XFV_ADDR), .FV_Q(XFV_Q),
++	.SV_ADDR(XSV_ADDR), .SV_Q(XSV_Q),
++	.LO_ADDR(XLO_ADDR), .LO_Q(XLO_Q),
++	.CROM_MASK(CROM_MASK),
++	.CROM_BASE(SYSTEM_CDx ? 7'd8 : CROM_START),
++	.SDRAM_OK(SPR_EN & ~CD_USE_SPR & ~RFSH),
++	.XS_REQ(XS_REQ), .XS_ADDR(XS_ADDR), .XS_ACK(XS_ACK), .XS_DATA(XS_DATA),
++	.PIXEL(XSPR_PIXEL), .OPAQUE(xspr_opaque_raw)
++);
++assign XSPR_OPAQUE = xspr_opaque_raw & SPR_EN;
++
+ assign VGA_SL = scale ? scale[1:0] - 1'd1 : 2'd0;
+ assign VGA_F1 = 0;
+ 
+diff --git a/rtl/cpu/cpu_speed.v b/rtl/cpu/cpu_speed.v
+new file mode 100644
+index 0000000..8aeb23d
+--- /dev/null
++++ b/rtl/cpu/cpu_speed.v
+@@ -0,0 +1,55 @@
++//============================================================================
++//  68000 clock enables for the NeoGeo core: 12MHz (original), 18MHz, 24MHz
++//
++//  This program is free software; you can redistribute it and/or modify it
++//  under the terms of the GNU General Public License as published by the Free
++//  Software Foundation; either version 2 of the License, or (at your option)
++//  any later version.
++//============================================================================
++//
++// fx68k takes two clock enables, PHI1 and PHI2, which must alternate. At 12MHz
++// the original enables from NEO-D0 are passed through unchanged. At 18MHz and
++// 24MHz a local generator makes the phases from the 48MHz clock:
++//   24MHz: one phase every clock
++//   18MHz: phases on 3 clocks out of 4
++// The speed is sampled while the CPU is in reset (nRESET low), so it changes
++// only on a reset and never in the middle of a bus cycle.
++// SLOW (only used when overclocked) makes the local generator run at the
++// stock 12MHz rate (a phase every other clock) for as long as it is high.
++// PHI1/PHI2 keep alternating across the change, so it can switch at any time.
++
++module cpu_speed(
++	input            CLK,           // 48MHz
++	input            nRESET,        // 68000 reset, active low
++	input      [1:0] SPEED,         // 0: 12MHz, 1: 18MHz, 2: 24MHz (3: 12MHz)
++	input            SLOW,          // run overclocked CPU at 12MHz for now
++	input            CLK_EN_68K_P,  // original 12MHz enables
++	input            CLK_EN_68K_N,
++	output           CPU_EN_P,
++	output           CPU_EN_N,
++	output           OVERCLOCK      // 18MHz or 24MHz selected
++);
++
++reg  [1:0] speed = 0;
++reg  [1:0] acc   = 0;
++reg        phi2  = 0;	// next phase is PHI2
++reg        en_p  = 0, en_n = 0;
++
++always @(posedge CLK) begin
++	if (!nRESET) speed <= (SPEED == 2'd3) ? 2'd0 : SPEED;
++
++	en_p <= 0;
++	en_n <= 0;
++	if (SLOW ? ~acc[0] : (speed == 2'd2 || (speed == 2'd1 && acc != 2'd3))) begin
++		if (phi2) en_n <= 1;
++		else      en_p <= 1;
++		phi2 <= ~phi2;
++	end
++	acc <= acc + 2'd1;
++end
++
++assign CPU_EN_P = (speed == 2'd0) ? CLK_EN_68K_P : en_p;
++assign CPU_EN_N = (speed == 2'd0) ? CLK_EN_68K_N : en_n;
++assign OVERCLOCK = (speed != 2'd0);
++
++endmodule
+diff --git a/rtl/mem/sdram_mux.sv b/rtl/mem/sdram_mux.sv
+index b74246f..a78b609 100644
+--- a/rtl/mem/sdram_mux.sv
++++ b/rtl/mem/sdram_mux.sv
+@@ -39,6 +39,7 @@ module sdram_mux(
+ 	input      [26:0] P2ROM_ADDR,
+ 	output reg [15:0] PROM_DATA,
+ 	output reg        PROM_DATA_READY,
++	output            CD_WR_PENDING,	// 68000 write to CD RAM (work RAM, FIX, SPR) not yet started in SDRAM
+ 
+ 	input             PCK2,
+ 	input      [15:0] S_LATCH,
+@@ -81,12 +82,29 @@ module sdram_mux(
+ 	input             CD_TR_WR_SPR,
+ 	input             CD_USE_FIX,
+ 	input             CD_TR_RD_FIX,
+-	input             CD_TR_WR_FIX
++	input             CD_TR_WR_FIX,
++
++	// Extra sprite renderer (neo_xspr): C ROM reads, lowest priority
++	input             XS_REQ,        // toggle
++	input      [26:0] XS_ADDR,
++	output reg        XS_ACK = 0,    // toggles when XS_DATA is valid
++	output reg [63:0] XS_DATA
+ );
+ 
+ 	localparam P2ROM_OFFSET = 27'h0300000;
+ 
+-	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN;
++	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN, XS_RD_RUN;
++
++	// The LSPC's sprite and fix fetches must be done soon after PCK1/PCK2
++	// fall (sprite data is used 24 cycles later). Extra sprite reads only
++	// start where they can't delay those: from 4 to 54 cycles after both.
++	// PCK1 and PCK2 each fall every 64 cycles.
++	reg  [6:0] pck1_cnt = 7'h7F, pck2_cnt = 7'h7F;
++	reg        xs_win;              // registered: counters as of the previous cycle
++	reg        xs_req_r;
++	reg        xs_busy;
++	wire       xs_pending = (xs_req_r != XS_ACK) & ~XS_RD_RUN & ~xs_busy;
++	reg  [1:0] xs_shift = 2'b11;
+ 
+ 	reg SDRAM_M68K_SIG_SR;
+ 	reg SDRAM_CROM_SIG_SR;
+@@ -107,6 +125,11 @@ module sdram_mux(
+ 	wire CD_WR_SDRAM_SIG = CD_EXT_WR | CD_TR_WR_FIX | CD_TR_WR_SPR;
+ 	wire CD_LDS_ONLY_WR = CD_TR_WR_FIX;
+ 
++	// The write takes its address and data from the 68000 bus when it starts,
++	// which can be several SDRAM accesses after the request (sprite, fix and
++	// 68000 reads go first). The 68000 must still be in that bus cycle then;
++	// neogeo.sv holds DTACK while this is high (only when overclocked).
++
+ 	wire [24:0] CD_REMAP_TR_ADDR;
+ 	always_comb begin
+ 		casez({CD_EXT_RD, CD_EXT_WR, CD_TR_AREA})
+@@ -126,8 +149,11 @@ module sdram_mux(
+ 		endcase
+ 	end
+ 	
++	reg CD_WR_REQ = 0;
++	assign CD_WR_PENDING = (REQ_CD_WR | CD_WR_REQ) & ~DMA_RUNNING;
++
+ 	always @(posedge CLK) begin
+-		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, CD_WR_REQ, RFSH_REQ;
++		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, RFSH_REQ;
+ 		reg nAS_PREV;
+ 		reg old_ready;
+ 		reg [8:0] refresh_cnt;
+@@ -151,6 +177,21 @@ module sdram_mux(
+ 			cr_shift <= cr_shift - 1'd1;
+ 		end
+ 
++		// extra sprite reads: collect the other 3 words, then acknowledge
++		xs_req_r <= XS_REQ;
++		pck1_cnt <= (SDRAM_CROM_SIG_SR & ~PCK1) ? 7'd0 : (&pck1_cnt ? pck1_cnt : pck1_cnt + 1'd1);
++		pck2_cnt <= (SDRAM_SROM_SIG_SR & ~PCK2) ? 7'd0 : (&pck2_cnt ? pck2_cnt : pck2_cnt + 1'd1);
++		xs_win   <= (pck1_cnt >= 7'd3) && (pck1_cnt <= 7'd53 || &pck1_cnt) &&
++		            (pck2_cnt >= 7'd3) && (pck2_cnt <= 7'd53 || &pck2_cnt);
++		if(~&xs_shift) begin
++			XS_DATA[xs_shift*16 +:16] <= SDRAM_DOUT;
++			xs_shift <= xs_shift - 1'd1;
++			if(!xs_shift) begin
++				XS_ACK  <= ~XS_ACK;
++				xs_busy <= 0;
++			end
++		end
++
+ 		nAS_PREV <= nAS;
+ 
+ 		CD_RD_SDRAM_SIG_SR <= CD_RD_SDRAM_SIG;
+@@ -169,6 +210,10 @@ module sdram_mux(
+ 			CD_WR_REQ   <= 0;
+ 
+ 			CROM_RD_RUN <= 0;
++			XS_RD_RUN   <= 0;
++			xs_busy     <= 0;
++			xs_shift    <= 2'b11;
++			XS_ACK      <= xs_req_r;
+ 			SFIX_RD_RUN <= 0;
+ 			M68K_RD_RUN <= 0;
+ 			CD_TR_RUN   <= 0;
+@@ -232,6 +277,11 @@ module sdram_mux(
+ 					CROM_RD_RUN    <= 0;
+ 					cr_shift       <= 2;
+ 				end
++				if (XS_RD_RUN) begin
++					XS_DATA[63:48] <= SDRAM_DOUT;
++					XS_RD_RUN      <= 0;
++					xs_shift       <= 2;
++				end
+ 
+ 				// Start requested access, if needed
+ 				if (M68K_RD_REQ | REQ_M68K_RD) begin
+@@ -289,6 +339,12 @@ module sdram_mux(
+ 					SDRAM_DIN      <= DMA_RUNNING ? (CD_LDS_ONLY_WR ? {DMA_DATA_OUT[7:0],DMA_DATA_OUT[7:0]} : DMA_DATA_OUT) :
+ 															  (CD_LDS_ONLY_WR ? {M68K_DATA[7:0],   M68K_DATA[7:0]}    : M68K_DATA);
+ 				end
++				else if (xs_pending & xs_win & ~REFRESH_EN) begin
++					XS_RD_RUN      <= 1;
++					xs_busy        <= 1;
++					SDRAM_RD       <= 1;
++					SDRAM_ADDR     <= XS_ADDR[26:1];
++				end
+ 				else if(REQ_RFSH & RFSH_REQ) begin
+ 					RFSH_REQ       <= 0;
+ 					SDRAM_RFSH     <= ~SDRAM_RFSH;
+diff --git a/rtl/video/fast_cycle.v b/rtl/video/fast_cycle.v
+index 6d352e5..efd9219 100644
+--- a/rtl/video/fast_cycle.v
++++ b/rtl/video/fast_cycle.v
+@@ -63,7 +63,8 @@ module fast_cycle_sync(
+ 	output [10:0] FVRAM_ADDR,
+ 	input [15:0] FVRAM_DATA_IN,
+ 	output [15:0] FVRAM_DATA_OUT,
+-	output CWE
++	output CWE,
++	output CPU_READ_HIGH_UPD        // CPU read latch loaded (used by the 68K overclock)
+ );
+ 
+ 	wire [10:0] C;
+@@ -500,4 +501,6 @@ module fast_cycle_sync(
+ 	assign HSHRINK = PIPE_C[12:9];
+ 	*/
+ 
++	assign CPU_READ_HIGH_UPD = CLK_CPU_READ_HIGH_FALL;
++
+ endmodule
+diff --git a/rtl/video/lspc2_a2.v b/rtl/video/lspc2_a2.v
+index 4ceffb9..94cbf20 100644
+--- a/rtl/video/lspc2_a2.v
++++ b/rtl/video/lspc2_a2.v
+@@ -82,7 +82,13 @@ module lspc2_a2_sync(
+ 	output [15:0] VRAM_ADDR,        // CPU access address
+ 	output  [1:0] VRAM_CYCLE,
+ 	output        SVRAM_WR,         // Full cycle WR signal
+-	output [15:0] LO_ROM_ADDR
++	output [15:0] LO_ROM_ADDR,
++	output        CPU_VRAM_BUSY,    // a CPU VRAM access is still in progress (68K overclock)
++	output        CPU_VRAM_WR_BUSY, // same, for writes: the read latches don't matter
++	output  [8:0] XSPR_RASTERC,     // for the extra sprite renderer (neo_xspr)
++	output  [8:0] XSPR_PIXELC,
++	output  [2:0] XSPR_AA_COUNT,
++	output        XSPR_AA_DISABLE
+ );
+ 
+ 	wire [8:0] PIXELC;
+@@ -723,6 +729,7 @@ module lspc2_a2_sync(
+ 	wire SPR_TILE_VFLIP, SPR_TILE_HFLIP, SPR_AA_3, SPR_AA_2, nCPU_WR_LOW, R91_nQ, T160A_OUT, T160B_OUT, CLK_ACTIVE_RD_EN;
+ 	wire ACTIVE_RD_PRE8;
+ 	wire PIXEL_H8_RISE = LSPC_EN_6M_N && PIXELC[3:0] == 4'b0111;
++	wire CPU_RD_LOW_UPD, CPU_RD_HIGH_UPD;	// read latch reloads, for CPU_VRAM_BUSY
+ 	slow_cycle_sync SCY_SYNC(CLK, CLK_EN_24M_P, LSPC_12M, LSPC_EN_12M_N, LSPC_EN_12M_P, LSPC_6M, LSPC_EN_6M_N, LSPC_3M, LSPC_EN_1_5M_N,
+ 							nRESETP, VRAM_ADDR[14:0], VRAM_WRITE,
+ 							REG_VRAMADDR[15], PIXELC[3], PIXEL_H8_RISE, PIXELC[8], RASTERC[7:3], PIXEL_HPLUS, ACTIVE_RD,
+@@ -730,7 +737,7 @@ module lspc2_a2_sync(
+ 							FIX_TILE, FIX_PAL, SPR_TILE, SPR_PAL, VRAM_LOW_READ, nCPU_WR_LOW, R91_nQ,
+ 							T160A_OUT, T160B_OUT, CLK_ACTIVE_RD_EN, ACTIVE_RD_PRE8, Q174B_OUT,
+ 							CLK_SPR_ATTR_EN, SPRITEMAP_ADDR_MSB, CLK_SPR_TILE_EN, P222A_OUT_RISE, ~P201_Q[1],
+-							SVRAM_ADDR, SVRAM_DATA_IN, SVRAM_DATA_OUT, BOE, BWE, FIXMAP_ADDR, SPRMAP_ADDR, VRAM_CYCLE);
++							SVRAM_ADDR, SVRAM_DATA_IN, SVRAM_DATA_OUT, BOE, BWE, FIXMAP_ADDR, SPRMAP_ADDR, VRAM_CYCLE, CPU_RD_LOW_UPD);
+ 	
+ 	wire nCPU_WR_HIGH, R91_Q, SPR_SIZE0, SPR_SIZE5, O159_QB;
+ 
+@@ -739,7 +746,7 @@ module lspc2_a2_sync(
+ 							PIXELC, RASTERC, P50_CO, nCPU_WR_HIGH, HSHRINK, PIPE_C, VRAM_HIGH_READ,
+ 							ACTIVE_RD, R91_Q, R91_nQ, T140_Q, T58A_OUT, T73A_OUT, U129A_Q, T125A_OUT, T125A_OUT_RISE,
+ 							CLK_ACTIVE_RD_EN, ACTIVE_RD_PRE8, SPR_Y, YSHRINK, SPR_SIZE0, SPR_SIZE5, O159_QB,
+-							FVRAM_ADDR, FVRAM_DATA_IN, FVRAM_DATA_OUT, CWE);
++							FVRAM_ADDR, FVRAM_DATA_IN, FVRAM_DATA_OUT, CWE, CPU_RD_HIGH_UPD);
+ 	
+ 	autoanim_sync AA_SYNC(CLK, RASTERC[8], nRESETP, AA_SPEED, AA_COUNT);
+ 	
+@@ -748,4 +755,43 @@ module lspc2_a2_sync(
+ 	wire nHSHRINK_OUT_A = ~HSHRINK_OUT_A;
+ 	wire nHSHRINK_OUT_B = ~HSHRINK_OUT_B;
+ 	
++	// CPU VRAM access tracking, used only when the 68000 is overclocked.
++	// Busy while a CPU write is waiting for its VRAM slot, and after the VRAM
++	// address changes until both read latches (low and high VRAM) are reloaded.
++	// At 12MHz the 68000 is never fast enough to catch the LSPC busy.
++	// The VRAM address register (F14) loads a clock or two after D112B_OUT
++	// goes back high, so a latch reload in those first clocks still holds the
++	// old address: reloads only count once the address has settled.
++	reg  rd_stale_lo = 1'b0, rd_stale_hi = 1'b0;
++	reg  [2:0] addr_settle = 3'd0;
++	always @(posedge CLK) begin
++		if (~D112B_OUT) begin		// VRAM address being updated (active low pulse)
++			rd_stale_lo <= 1'b1;
++			rd_stale_hi <= 1'b1;
++			addr_settle <= 3'd7;
++		end else if (addr_settle != 3'd0) begin
++			addr_settle <= addr_settle - 3'd1;
++		end else begin
++			if (CPU_RD_LOW_UPD)  rd_stale_lo <= 1'b0;
++			if (CPU_RD_HIGH_UPD) rd_stale_hi <= 1'b0;
++		end
++	end
++	// registered: D112B_OUT depends on the (gated) CPU strobes, so a combinational
++	// busy would loop back into the gating. The 1-clock lag is harmless: the
++	// access that caused it was already granted, and the next one is many clocks later.
++	reg  vram_busy_r = 1'b0, vram_wr_busy_r = 1'b0;
++	always @(posedge CLK) begin
++		vram_busy_r    <= ~nVRAM_WRITE_REQ | ~D112B_OUT | rd_stale_lo | rd_stale_hi;
++		// a write only needs the previous write done and the address settled;
++		// waiting for the read latches made VRAM write loops slower than 12MHz
++		vram_wr_busy_r <= ~nVRAM_WRITE_REQ | ~D112B_OUT | (addr_settle != 3'd0);
++	end
++	assign CPU_VRAM_BUSY    = vram_busy_r;
++	assign CPU_VRAM_WR_BUSY = vram_wr_busy_r;
++
++	assign XSPR_RASTERC    = RASTERC;
++	assign XSPR_PIXELC     = PIXELC;
++	assign XSPR_AA_COUNT   = AA_COUNT;
++	assign XSPR_AA_DISABLE = AA_DISABLE;
++
+ endmodule
+diff --git a/rtl/video/neo_b1.v b/rtl/video/neo_b1.v
+index 47cdf3f..62c619f 100644
+--- a/rtl/video/neo_b1.v
++++ b/rtl/video/neo_b1.v
+@@ -49,7 +49,10 @@ module neo_b1(
+ 	input nRST,
+ 	input DOGE,
+ 	
+-	input EN_FIX
++	input EN_FIX,
++
++	input [11:0] XSPR_PIXEL,	// extra sprites (neo_xspr), drawn over the LSPC's
++	input XSPR_OPAQUE
+ );
+ 
+ 	reg nCPU_ACCESS;
+@@ -127,7 +130,8 @@ module neo_b1(
+ 
+ 	// Fix/Sprite/Blanking select
+ 	// KUQA KUTU JARA...
+-	assign PA_MUX_A = FIX_OPAQUE ? {4'b0000, FIX_PAL_REG, FIX_COLOR} : RAM_MUX_OUT;
++	assign PA_MUX_A = FIX_OPAQUE ? {4'b0000, FIX_PAL_REG, FIX_COLOR} :
++							XSPR_OPAQUE ? XSPR_PIXEL : RAM_MUX_OUT;
+ 	assign PA_MUX_B = CHBL ? 12'h000 : PA_MUX_A;
+ 
+ 	// KAWE KESE...
+diff --git a/rtl/video/neo_xspr.v b/rtl/video/neo_xspr.v
+new file mode 100644
+index 0000000..4c85197
+--- /dev/null
++++ b/rtl/video/neo_xspr.v
+@@ -0,0 +1,449 @@
++//============================================================================
++//  SNK NeoGeo for MiSTer - extra sprite renderer (no 96 sprites per line limit)
++//
++//  This program is free software; you can redistribute it and/or modify it
++//  under the terms of the GNU General Public License as published by the Free
++//  Software Foundation; either version 2 of the License, or (at your option)
++//  any later version.
++//============================================================================
++//
++// The LSPC draws at most 96 sprites per line: the first 96 sprites (in sprite
++// number order) that cross the line. This module draws the ones after those
++// into its own line buffers, and NEO-B1 shows its pixels on top of the LSPC's
++// sprites (later sprites have priority on the Neo Geo) and under the fix layer.
++//
++// It works one line ahead of the display, like the LSPC:
++//   during line s:  parse   line s+2 (all 381 sprites, keep the actives after
++//                                     the first SKIP of them)
++//                   render  line s+1 (from the list parsed during line s-1)
++//                   display line s
++// Parsing reads sprite attributes from a second port of the fast VRAM,
++// rendering reads the tile map from a second port of the slow VRAM, the LO
++// (vertical shrink) ROM through its spare port, and sprite graphics from
++// SDRAM through the SDRAM mux (lowest priority, between the LSPC's fetches).
++// It follows the core's LSPC exactly (same shrink tables, "continuous"
++// sprites, auto-animation, chaining), which is checked in simulation by
++// making it draw every sprite with the LSPC's sprites hidden.
++//
++// If a line has more extra sprites than can be fetched in one line time, the
++// last ones are not drawn (as without this module).
++
++module neo_xspr #(
++	parameter MAXOVF = 192             // extra sprites per line (after the first 96)
++)(
++	input             CLK,             // 48MHz
++	input             nRESET,
++	input             ENABLE,
++	input       [8:0] SKIP,            // 96; 0 to draw everything (test)
++
++	input       [8:0] RASTERC,
++	input       [8:0] PIXELC,
++	input       [2:0] AA_COUNT,
++	input             AA_DISABLE,
++
++	output reg [10:0] FV_ADDR,         // fast VRAM (SCB2-4), 1 clock latency
++	input      [15:0] FV_Q,
++	output reg [14:0] SV_ADDR,         // slow VRAM (SCB1), 1 clock latency
++	input      [15:0] SV_Q,
++	output reg [15:0] LO_ADDR,         // LO ROM, 1 clock latency
++	input       [7:0] LO_Q,
++
++	input      [26:0] CROM_MASK,
++	input       [6:0] CROM_BASE,       // C ROM position in SDRAM (MB)
++	input             SDRAM_OK,        // sprites enabled, no refresh period
++	output reg        XS_REQ = 0,      // toggle
++	output reg [26:0] XS_ADDR,
++	input             XS_ACK,          // toggles when XS_DATA is valid
++	input      [63:0] XS_DATA,
++
++	output     [11:0] PIXEL,           // to NEO-B1, valid on CLK_EN_6MB
++	output            OPAQUE
++);
++
++localparam [8:0] LAST_SPRITE = 9'd380;
++
++// ------------------------------------------------------------- line timing
++// RASTERC changes at the start of each line period (PIXELC 256). LC counts
++// the periods; its LSB selects the list and line buffer banks.
++reg  [8:0] rast_d;
++reg        lc = 0;
++wire       new_line = (RASTERC != rast_d);
++always @(posedge CLK) begin
++	rast_d <= RASTERC;
++	if (new_line) lc <= ~lc;
++end
++
++wire [8:0] line_disp = RASTERC ^ 9'h100;         // scanline shown in this period
++wire [8:0] line_rend = line_disp + 9'd1;
++wire [8:0] line_pars = line_disp + 9'd2;
++// banks, used on the new_line clock (LC still holds the previous period's value)
++wire       lc_rend   = lc;           // this period + 1
++wire       lc_pars   = ~lc;          // this period + 2
++
++function visible(input [8:0] l);
++	visible = (l >= 9'd16) && (l < 9'd240);
++endfunction
++
++// ------------------------------------------------------------- lists
++// Entry: sprite # (9), X (9), h-shrink (4), v-shrink (8), SCB3 Y (9), size (6)
++localparam EW = 45;
++localparam LW = $clog2(MAXOVF);
++reg  [EW-1:0] list[0:(2<<LW)-1];
++reg  [LW:0]   list_cnt[0:1];
++reg  [EW-1:0] list_q;
++reg  [LW:0]   list_rd;
++reg           list_we;
++reg  [LW:0]   list_wa;
++reg  [EW-1:0] list_wd;
++reg           list_wbank, list_rbank;
++always @(posedge CLK) begin
++	if (list_we) list[{list_wbank, list_wa[LW-1:0]}] <= list_wd;
++	list_q <= list[{list_rbank, list_rd[LW-1:0]}];
++end
++
++// ------------------------------------------------------------- parser
++localparam P_IDLE = 2'd0, P_Y = 2'd1, P_Z = 2'd2, P_X = 2'd3;
++reg  [1:0] pst = P_IDLE;
++reg  [8:0] pn;                 // sprite #
++reg  [8:0] ppos;               // actives so far
++reg  [LW:0] povf;
++reg  [8:0] pline;
++reg        pbank;
++reg  [8:0] ld_ys;  reg [5:0] ld_rows;   // last non-sticky SCB3 (for on-line test)
++reg  [8:0] ch_x;   reg [3:0] ch_zx;     // chaining state over the active list
++reg  [7:0] ch_zy;  reg [8:0] ch_ys; reg [5:0] ch_rows;
++reg        p_sticky;
++reg        pwait;
++reg [15:0] p_zc;
++
++wire       y_sticky = FV_Q[6];
++wire [8:0] y_ys     = y_sticky ? ld_ys   : FV_Q[15:7];
++wire [5:0] y_rows   = y_sticky ? ld_rows : FV_Q[5:0];
++wire [8:0] y_sl     = pline + y_ys;
++wire       y_active = (y_rows != 0) && (y_rows[5] || (y_sl < {y_rows[4:0], 4'd0}));
++
++always @(posedge CLK) begin
++	list_we <= 0;
++	if (!nRESET || !ENABLE) begin
++		pst <= P_IDLE;
++		list_cnt[0] <= 0;
++		list_cnt[1] <= 0;
++	end
++	else if (new_line) begin
++		// start parsing line s+2 (the previous parse has always finished)
++		pline <= line_pars;
++		pbank <= lc_pars;
++		list_cnt[lc_pars] <= 0;
++		pn <= 0; ppos <= 0; povf <= 0;
++		ld_ys <= 0; ld_rows <= 0;
++		ch_x <= 0; ch_zx <= 0; ch_zy <= 0; ch_ys <= 0; ch_rows <= 0;
++		FV_ADDR <= 11'h200;
++		pwait <= 1;
++		pst <= visible(line_pars) ? P_Y : P_IDLE;
++	end
++	else if (pwait) pwait <= 0;        // memory read of the new address
++	else case (pst)
++		P_Y: begin     // FV_Q = SCB3[pn]
++			if (!y_sticky) begin
++				ld_ys <= FV_Q[15:7];
++				ld_rows <= FV_Q[5:0];
++			end
++			p_sticky <= y_sticky;
++			if (y_active) begin
++				FV_ADDR <= {2'b00, pn};            // SCB2
++				pwait <= 1;
++				pst <= P_Z;
++				if (!y_sticky) begin ch_ys <= y_ys; ch_rows <= y_rows; end
++			end
++			else if (pn == LAST_SPRITE) begin
++				list_cnt[pbank] <= povf;
++				pst <= P_IDLE;
++			end
++			else begin
++				pn <= pn + 1'd1;
++				FV_ADDR <= {2'b01, pn + 1'd1};     // SCB3
++				pwait <= 1;
++			end
++		end
++		P_Z: begin     // FV_Q = SCB2[pn]
++			p_zc <= FV_Q;
++			FV_ADDR <= {2'b10, pn};                // SCB4
++			pwait <= 1;
++			pst <= P_X;
++		end
++		P_X: begin     // FV_Q = SCB4[pn]
++			if (p_sticky) begin
++				ch_x  <= ch_x + {5'd0, ch_zx} + 1'd1;
++				ch_zx <= p_zc[11:8];
++			end
++			else begin
++				ch_x  <= FV_Q[15:7];
++				ch_zx <= p_zc[11:8];
++				ch_zy <= p_zc[7:0];
++			end
++			if (ppos >= SKIP && povf != MAXOVF) begin
++				list_we    <= 1;
++				list_wbank <= pbank;
++				list_wa    <= povf;
++				list_wd    <= {pn,
++				               p_sticky ? ch_x + {5'd0, ch_zx} + 1'd1 : FV_Q[15:7],
++				               p_zc[11:8],
++				               p_sticky ? ch_zy : p_zc[7:0],
++				               ch_ys, ch_rows};
++				povf <= povf + 1'd1;
++			end
++			ppos <= ppos + 1'd1;
++			if (pn == LAST_SPRITE) begin
++				list_cnt[pbank] <= (ppos >= SKIP && povf != MAXOVF) ? povf + 1'd1 : povf;
++				pst <= P_IDLE;
++			end
++			else begin
++				pn <= pn + 1'd1;
++				FV_ADDR <= {2'b01, pn + 1'd1};
++				pwait <= 1;
++				pst <= P_Y;
++			end
++		end
++		default: ;
++	endcase
++end
++
++// ------------------------------------------------------------- renderer
++// Stage A: list entry -> LO ROM -> tile map -> C ROM address
++// Stage B: C ROM fetch through the SDRAM mux
++// Stage C: 16 pixels into the line buffer (h-shrink, h-flip, transparency),
++//          2 per clock (even and odd X are in separate RAMs)
++localparam A_IDLE = 3'd0, A_LIST = 3'd1, A_ENT = 3'd2, A_LO = 3'd3, A_T0 = 3'd4, A_T1 = 3'd5, A_T2 = 3'd6, A_T3 = 3'd7;
++reg  [2:0] ast = A_IDLE;
++reg  [8:0] rline;
++reg        rbank;
++reg  [LW:0] rcnt;
++
++reg  [8:0] a_n, a_x; reg [3:0] a_zx;
++reg        a_inv;
++reg  [3:0] a_sy0;
++reg [15:0] a_code_lo;
++
++// A -> B
++reg        b_full = 0;
++reg [26:0] b_addr; reg [7:0] b_pal; reg b_hflip; reg [3:0] b_zx; reg [8:0] b_x;
++// B (request in flight / data waiting for C)
++reg        b_busy = 0, b_got = 0, b_discard = 0;
++reg [63:0] b_data; reg [7:0] bb_pal; reg bb_hflip; reg [3:0] bb_zx; reg [8:0] bb_x;
++// C
++reg        c_full = 0;
++reg [63:0] c_data; reg [7:0] c_pal; reg c_hflip; reg [3:0] c_zx;
++reg  [2:0] c_k;                 // pixel pair
++reg  [8:0] c_xx;
++reg        lbe_we, lbo_we;
++reg  [8:0] lbe_wa, lbo_wa;
++reg [11:0] lbe_wd, lbo_wd;
++
++// Y -> LO ROM address (as the LSPC: SPR_Y_ADD, LO_LINE_A/B, SPR_CONTINUOUS)
++wire [8:0] e_sl   = rline + list_q[14:6];
++wire       e_inv  = e_sl[8];
++wire [7:0] e_zl   = e_sl[7:0] ^ {8{e_inv}};
++wire [7:0] e_zy   = list_q[22:15];
++wire [5:0] e_rows = list_q[5:0];
++wire       e_cont = e_rows[5] & e_rows[0] & (e_zl > e_zy);
++wire [7:0] e_zlb  = e_zl + {~e_zy[6:0], 1'b0};
++wire [7:0] e_zl2  = e_cont ? ~e_zlb : e_zl;
++
++// tile attributes -> C ROM address
++wire [15:0] t_attr = SV_Q;
++wire        t_aa3  = t_attr[3] & ~AA_DISABLE;
++wire        t_aa2  = (t_attr[2] & ~AA_DISABLE) | t_aa3;
++wire [19:0] t_code = {t_attr[7:4], a_code_lo[15:3],
++                      t_aa3 ? AA_COUNT[2] : a_code_lo[2],
++                      t_aa2 ? AA_COUNT[1:0] : a_code_lo[1:0]};
++wire  [3:0] t_sy   = a_sy0 ^ {4{t_attr[1]}};
++wire [26:0] c_addr_masked = {t_code, t_sy, 3'b000} & CROM_MASK;
++
++// h-shrink tables measured on the core: source pixels drawn for each value
++function [15:0] zoom_row(input [3:0] z);
++	case (z)
++		4'd0:  zoom_row = 16'b0000000100000000;
++		4'd1:  zoom_row = 16'b0000000100010000;
++		4'd2:  zoom_row = 16'b0001000100010000;
++		4'd3:  zoom_row = 16'b0001000100010100;
++		4'd4:  zoom_row = 16'b0101000100010100;
++		4'd5:  zoom_row = 16'b0101000101010100;
++		4'd6:  zoom_row = 16'b0101010101010100;
++		4'd7:  zoom_row = 16'b0101010101010101;
++		4'd8:  zoom_row = 16'b0101011101010101;
++		4'd9:  zoom_row = 16'b0101011101011101;
++		4'd10: zoom_row = 16'b1101011101011101;
++		4'd11: zoom_row = 16'b1101011111011101;
++		4'd12: zoom_row = 16'b1111011111011101;
++		4'd13: zoom_row = 16'b1111011111011111;
++		4'd14: zoom_row = 16'b1111111111011111;
++		4'd15: zoom_row = 16'b1111111111111111;
++	endcase
++endfunction
++
++// colour of pixel k (screen order) of the fetched line
++function [3:0] pix(input [63:0] d, input hflip, input [3:0] k);
++	reg [3:0] src; reg [31:0] h;
++	begin
++		src = hflip ? ~k : k;
++		h = src[3] ? d[31:0] : d[63:32];
++		pix = {h[24 + src[2:0]], h[16 + src[2:0]], h[8 + src[2:0]], h[src[2:0]]};
++	end
++endfunction
++
++wire [15:0] c_zrow = zoom_row(c_zx);
++wire        c_s0   = c_zrow[{c_k, 1'b0}];            // pixel 2j drawn
++wire        c_s1   = c_zrow[{c_k, 1'b1}];            // pixel 2j+1 drawn
++wire  [3:0] c_col0 = pix(c_data, c_hflip, {c_k, 1'b0});
++wire  [3:0] c_col1 = pix(c_data, c_hflip, {c_k, 1'b1});
++wire  [8:0] c_x0   = c_xx;                           // where they go
++wire  [8:0] c_x1   = c_xx + {8'd0, c_s0};
++wire        c_w0   = c_s0 & (c_col0 != 0);
++wire        c_w1   = c_s1 & (c_col1 != 0);
++
++wire run = nRESET & ENABLE;
++
++always @(posedge CLK) begin
++	lbe_we <= 0;
++	lbo_we <= 0;
++
++	// ---- stage A
++	if (!run || new_line) begin
++		ast <= A_IDLE;
++		b_full <= 0;
++		if (run && new_line && visible(line_rend)) begin
++			rline <= line_rend;
++			rbank <= lc_rend;
++			rcnt  <= list_cnt[lc_rend];
++			list_rbank <= lc_rend;
++			list_rd <= 0;
++			ast <= A_LIST;
++		end
++	end
++	else begin
++		case (ast)
++			A_LIST: ast <= (list_rd == rcnt) ? A_IDLE : A_ENT;   // list_q loads
++			A_ENT: begin                                           // list_q valid
++				a_n  <= list_q[44:36];
++				a_x  <= list_q[35:27];
++				a_zx <= list_q[26:23];
++				LO_ADDR <= {e_zy, e_zl2};
++				a_inv <= e_inv ^ e_cont;
++				ast <= A_LO;
++			end
++			A_LO: ast <= A_T0;                                     // LO ROM read
++			A_T0: begin                                            // LO_Q valid
++				a_sy0   <= LO_Q[3:0] ^ {4{a_inv}};
++				SV_ADDR <= {a_n, a_inv, LO_Q[7:4] ^ {4{a_inv}}, 1'b0};
++				ast <= A_T1;
++			end
++			A_T1: begin                                            // tile code read
++				SV_ADDR[0] <= 1'b1;
++				ast <= A_T2;
++			end
++			A_T2: begin                                            // SV_Q = tile code
++				a_code_lo <= SV_Q;
++				ast <= A_T3;
++			end
++			A_T3: if (!b_full) begin                               // SV_Q = attributes
++				b_addr  <= c_addr_masked + {CROM_BASE, 20'd0};
++				b_pal   <= t_attr[15:8];
++				b_hflip <= t_attr[0];
++				b_zx    <= a_zx;
++				b_x     <= a_x;
++				b_full  <= 1;
++				list_rd <= list_rd + 1'd1;
++				ast <= A_LIST;
++			end
++			default: ;
++		endcase
++	end
++
++	// ---- stage B: one SDRAM read at a time. A request in flight is always
++	// completed (its data dropped if the line changed meanwhile).
++	if (!b_busy) begin
++		if (run && !new_line && b_full && SDRAM_OK) begin
++			XS_ADDR  <= b_addr;
++			XS_REQ   <= ~XS_REQ;
++			b_busy   <= 1;
++			b_got    <= 0;
++			b_discard <= 0;
++			bb_pal   <= b_pal; bb_hflip <= b_hflip; bb_zx <= b_zx; bb_x <= b_x;
++			b_full   <= 0;
++		end
++	end
++	else begin
++		if (!run || new_line) b_discard <= 1;
++		if (!b_got && (XS_ACK == XS_REQ)) begin
++			b_data <= XS_DATA;
++			b_got  <= 1;
++		end
++		if (b_got) begin
++			if (b_discard || !run || new_line) b_busy <= 0;
++			else if (!c_full) begin
++				c_data <= b_data; c_pal <= bb_pal; c_hflip <= bb_hflip; c_zx <= bb_zx;
++				c_xx <= bb_x; c_k <= 0;
++				c_full <= 1;
++				b_busy <= 0;
++			end
++		end
++	end
++
++	// ---- stage C: two source pixels per clock; two drawn ones always have
++	// consecutive X, so they go to different RAMs
++	if (!run || new_line) c_full <= 0;
++	else if (c_full) begin
++		if (c_w0) begin
++			if (c_x0[0]) begin lbo_we <= 1; lbo_wa <= {rbank, c_x0[8:1]}; lbo_wd <= {c_pal, c_col0}; end
++			else         begin lbe_we <= 1; lbe_wa <= {rbank, c_x0[8:1]}; lbe_wd <= {c_pal, c_col0}; end
++		end
++		if (c_w1) begin
++			if (c_x1[0]) begin lbo_we <= 1; lbo_wa <= {rbank, c_x1[8:1]}; lbo_wd <= {c_pal, c_col1}; end
++			else         begin lbe_we <= 1; lbe_wa <= {rbank, c_x1[8:1]}; lbe_wd <= {c_pal, c_col1}; end
++		end
++		c_xx <= c_xx + {8'd0, c_s0} + {8'd0, c_s1};
++		c_k <= c_k + 1'd1;
++		if (c_k == 3'd7) c_full <= 0;
++	end
++end
++
++// ------------------------------------------------------------- line buffers
++// Two 512-pixel buffers (palette + colour; colour 0 = empty), each split in
++// even and odd X. The display side reads each pixel for NEO-B1 and then
++// clears it.
++// PIXEL/OPAQUE must be valid at NEO-B1's CLK_EN_6MB, 3 clocks after PIXELC
++// changes, and NEO-B1 registers the pixel for the next PIXELC value: so the
++// buffer is read at the screen X of PIXELC + 1.
++wire [8:0] pix_next = (PIXELC == 9'd511) ? 9'd128 : PIXELC + 1'd1;
++wire       x_ok     = (pix_next >= 9'd271) || (pix_next >= 9'd128 && pix_next <= 9'd206);
++wire [8:0] x_out    = (pix_next >= 9'd271) ? pix_next - 9'd271 : pix_next - 9'd128 + 9'd241;
++
++reg  [8:0] pix_d;
++reg  [2:0] pix_age;            // clocks since PIXELC changed
++always @(posedge CLK) begin
++	pix_d <= PIXELC;
++	pix_age <= (PIXELC != pix_d) ? 3'd0 : (pix_age == 3'd7 ? 3'd7 : pix_age + 1'd1);
++end
++// clear the pixel 5 clocks after PIXELC changed (NEO-B1 took it at 3)
++wire       lb_clr = (pix_age == 3'd4) && x_ok;
++
++wire [11:0] lbe_q, lbo_q;
++reg         x_ok_r, x_odd_r;
++dpram #(9, 12) LBE(
++	.clock_a(CLK), .address_a(lbe_wa), .data_a(lbe_wd), .wren_a(lbe_we), .q_a(),
++	.clock_b(CLK), .address_b({lc, x_out[8:1]}), .data_b(12'd0), .wren_b(lb_clr & ~x_out[0]), .q_b(lbe_q)
++);
++dpram #(9, 12) LBO(
++	.clock_a(CLK), .address_a(lbo_wa), .data_a(lbo_wd), .wren_a(lbo_we), .q_a(),
++	.clock_b(CLK), .address_b({lc, x_out[8:1]}), .data_b(12'd0), .wren_b(lb_clr & x_out[0]), .q_b(lbo_q)
++);
++always @(posedge CLK) begin
++	x_ok_r  <= x_ok & ENABLE & visible(line_disp);
++	x_odd_r <= x_out[0];
++end
++wire [11:0] lb_q = x_odd_r ? lbo_q : lbe_q;
++
++assign PIXEL  = lb_q;
++assign OPAQUE = x_ok_r && (lb_q[3:0] != 4'd0);
++
++endmodule
+diff --git a/rtl/video/slow_cycle.v b/rtl/video/slow_cycle.v
+index af11535..c95d46c 100644
+--- a/rtl/video/slow_cycle.v
++++ b/rtl/video/slow_cycle.v
+@@ -70,7 +70,8 @@ module slow_cycle_sync(
+ 	
+ 	output [14:0] FIXMAP_ADDR,		// Extracted for NEO-CMC
+ 	output [14:0] SPRMAP_ADDR,
+-	output [1:0] VRAM_CYCLE         // Hint to SDRAM controller (10 - Sprite map read, 01 - CPU R/W, 00 - fixmap read)
++	output [1:0] VRAM_CYCLE,         // Hint to SDRAM controller (10 - Sprite map read, 01 - CPU R/W, 00 - fixmap read)
++	output CPU_READ_LOW_UPD         // CPU read latch loaded (used by the 68K overclock)
+ );
+ 
+ 	wire [14:0] B;
+@@ -202,4 +203,6 @@ module slow_cycle_sync(
+ 	//vram_slow_u VRAMLU(B, E[15:8], 1'b0, BOE, BWE);
+ 	//vram_slow_l VRAMLL(B, E[7:0], 1'b0, BOE, BWE);
+ 
++	assign CPU_READ_LOW_UPD = CLK_CPU_READ_LOW_EN;
++
+ endmodule
+diff --git a/rtl/video/video.qip b/rtl/video/video.qip
+index 0ca9592..c8b4f56 100644
+--- a/rtl/video/video.qip
++++ b/rtl/video/video.qip
+@@ -13,3 +13,4 @@ set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) hshrink
+ set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) fast_cycle.v ]
+ set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) autoanim.v ]
+ set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) neo_cmc.v ]
++set_global_assignment -name VERILOG_FILE [file join $::quartus(qip_path) neo_xspr.v ]

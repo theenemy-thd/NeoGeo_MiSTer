@@ -1,0 +1,57 @@
+diff --git a/neogeo.sv b/neogeo.sv
+index c6a8618..8a44a52 100644
+--- a/neogeo.sv
++++ b/neogeo.sv
+@@ -469,11 +469,11 @@ wire nLSPOE, nLSPWE;
+ // ($3C0000/2/4) while the LSPC is still busy with the previous access, the
+ // access is held back (LSPC strobes and DTACK) until the LSPC is free. Then it
+ // goes through once, and DTACK waits 3 more clocks so read data is valid.
+-wire LSPC_VRAM_BUSY;
++wire LSPC_VRAM_BUSY, LSPC_VRAM_WR_BUSY;
+ wire lspc_vram_acc = (~nLSPWE & (M68K_ADDR[3:1] <= 3'd2)) | (~nLSPOE & ~M68K_ADDR[2]);
+ reg  lspc_granted = 0, lspc_waited = 0;
+ reg  [1:0] lspc_dly = 0;
+-wire lspc_hold = CPU_OVERCLOCK & lspc_vram_acc & ~lspc_granted & LSPC_VRAM_BUSY;
++wire lspc_hold = CPU_OVERCLOCK & lspc_vram_acc & ~lspc_granted & (~nLSPWE ? LSPC_VRAM_WR_BUSY : LSPC_VRAM_BUSY);
+ wire lspc_dtack_wait = lspc_hold | (lspc_waited & (lspc_dly != 2'd3));
+ 
+ always @(posedge CLK_48M) begin
+@@ -2168,6 +2168,7 @@ lspc2_a2_sync	LSPC(
+ 	.VMODE(video_mode),
+ 	.FIXMAP_ADDR(FIXMAP_ADDR),	// Extracted for NEO-CMC
+ 	.CPU_VRAM_BUSY(LSPC_VRAM_BUSY),
++	.CPU_VRAM_WR_BUSY(LSPC_VRAM_WR_BUSY),
+ 	.XSPR_RASTERC(XSPR_RASTERC), .XSPR_PIXELC(XSPR_PIXELC),
+ 	.XSPR_AA_COUNT(XSPR_AA_COUNT), .XSPR_AA_DISABLE(XSPR_AA_DISABLE)
+ );
+diff --git a/rtl/video/lspc2_a2.v b/rtl/video/lspc2_a2.v
+index 05fc290..94cbf20 100644
+--- a/rtl/video/lspc2_a2.v
++++ b/rtl/video/lspc2_a2.v
+@@ -84,6 +84,7 @@ module lspc2_a2_sync(
+ 	output        SVRAM_WR,         // Full cycle WR signal
+ 	output [15:0] LO_ROM_ADDR,
+ 	output        CPU_VRAM_BUSY,    // a CPU VRAM access is still in progress (68K overclock)
++	output        CPU_VRAM_WR_BUSY, // same, for writes: the read latches don't matter
+ 	output  [8:0] XSPR_RASTERC,     // for the extra sprite renderer (neo_xspr)
+ 	output  [8:0] XSPR_PIXELC,
+ 	output  [2:0] XSPR_AA_COUNT,
+@@ -778,9 +779,15 @@ module lspc2_a2_sync(
+ 	// registered: D112B_OUT depends on the (gated) CPU strobes, so a combinational
+ 	// busy would loop back into the gating. The 1-clock lag is harmless: the
+ 	// access that caused it was already granted, and the next one is many clocks later.
+-	reg  vram_busy_r = 1'b0;
+-	always @(posedge CLK) vram_busy_r <= ~nVRAM_WRITE_REQ | ~D112B_OUT | rd_stale_lo | rd_stale_hi;
+-	assign CPU_VRAM_BUSY = vram_busy_r;
++	reg  vram_busy_r = 1'b0, vram_wr_busy_r = 1'b0;
++	always @(posedge CLK) begin
++		vram_busy_r    <= ~nVRAM_WRITE_REQ | ~D112B_OUT | rd_stale_lo | rd_stale_hi;
++		// a write only needs the previous write done and the address settled;
++		// waiting for the read latches made VRAM write loops slower than 12MHz
++		vram_wr_busy_r <= ~nVRAM_WRITE_REQ | ~D112B_OUT | (addr_settle != 3'd0);
++	end
++	assign CPU_VRAM_BUSY    = vram_busy_r;
++	assign CPU_VRAM_WR_BUSY = vram_wr_busy_r;
+ 
+ 	assign XSPR_RASTERC    = RASTERC;
+ 	assign XSPR_PIXELC     = PIXELC;

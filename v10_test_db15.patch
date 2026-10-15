@@ -1,0 +1,189 @@
+diff -ruN --strip-trailing-cr -x README_v10_TEST.md ex2/NeoGeoTREX_v9_TEST/files.qip v10/NeoGeoTREX_v10_TEST/files.qip
+--- ex2/NeoGeoTREX_v9_TEST/files.qip	2026-10-02 22:50:41.000000000 +0100
++++ v10/NeoGeoTREX_v10_TEST/files.qip	2026-10-14 21:38:11.255244858 +0100
+@@ -11,5 +11,6 @@
+ set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_z80.v
+ set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_68k.v
+ set_global_assignment -name VERILOG_FILE rtl/cpu/cpu_speed.v
++set_global_assignment -name VERILOG_FILE rtl/io/neo_db15.v
+ set_global_assignment -name SYSTEMVERILOG_FILE neogeo.sv
+ set_global_assignment -name SDC_FILE NeoGeo.sdc
+diff -ruN --strip-trailing-cr -x README_v10_TEST.md ex2/NeoGeoTREX_v9_TEST/neogeo.sv v10/NeoGeoTREX_v10_TEST/neogeo.sv
+--- ex2/NeoGeoTREX_v9_TEST/neogeo.sv	2026-10-02 22:50:42.000000000 +0100
++++ v10/NeoGeoTREX_v10_TEST/neogeo.sv	2026-10-14 21:38:34.213824294 +0100
+@@ -42,7 +42,6 @@
+ );
+ 
+ assign ADC_BUS  = 'Z;
+-assign USER_OUT = '1;
+ assign {UART_RTS, UART_TXD, UART_DTR} = 0;
+ assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
+ 
+@@ -142,6 +141,7 @@
+ 	"-;",
+ 	"o9A,Input,Joystick or Spinner,Joystick,Spinner,Mouse(Irr.Maze);",
+ 	"oBC,Multitap,No,NEO-FTC1B,NeoTris;",
++	"oH,User Port,Off,DB15 Joystick;",
+ 	"-;",
+ 	"H0O4,Memory Card,Plugged,Unplugged;",
+ 	"RL,Reload Memory Card;",
+@@ -313,8 +313,10 @@
+ wire  [1:0] sd_rd;
+ wire  [1:0] sd_ack;
+ 
+-wire [15:0] joystick_0;	// 21--HNLS DCBAUDLR  (1=A+B, 2=C+D combos)
+-wire [15:0] joystick_1;
++wire [15:0] usb_joystick_0, usb_joystick_1;
++wire [15:0] db15_joy_0, db15_joy_1;	// DB15 user-port pads (TREX v10)
++wire [15:0] joystick_0 = usb_joystick_0 | db15_joy_0;	// 21--HNLS DCBAUDLR  (1=A+B, 2=C+D combos); USB + DB15
++wire [15:0] joystick_1 = usb_joystick_1 | db15_joy_1;
+ wire [15:0] joystick_2;
+ wire [15:0] joystick_3;
+ wire  [8:0] spinner_0, spinner_1;
+@@ -346,7 +348,7 @@
+ 
+ 	.forced_scandoubler(forced_scandoubler),
+ 
+-	.joystick_0(joystick_0), .joystick_1(joystick_1),
++	.joystick_0(usb_joystick_0), .joystick_1(usb_joystick_1),
+ 	.joystick_2(joystick_2), .joystick_3(joystick_3),
+ 	.spinner_0(spinner_0), .spinner_1(spinner_1),
+ 	.ps2_mouse(ps2_mouse),
+@@ -384,6 +386,30 @@
+ 	.EXT_BUS(EXT_BUS)
+ );
+ 
++// TREX v10: DB15 splitter on the user port (OSD "User Port"), status[49].
++wire db15_en = status[49];
++wire db15_clk, db15_load;
++wire [11:0] db15_1, db15_2;	// active high: Select,Start,F,E,D,C,B,A,U,D,L,R
++assign USER_PP  = db15_en;
++assign USER_OUT = db15_en ? {5'h1f, db15_clk, db15_load} : 7'h7f;
++
++neo_db15 neo_db15
++(
++	.clk(clk_sys),
++	.joy_clk(db15_clk),
++	.joy_load(db15_load),
++	.joy_data(USER_IN[5]),
++	.joystick1(db15_1),
++	.joystick2(db15_2)
++);
++
++// DB15 buttons -> core layout (bit 10 Coin, 9 Select, 8 Start, 7-4 D C B A, 3-0 U D L R)
++function [15:0] db15_map(input [11:0] j);
++	db15_map = {5'd0, j[8], j[11], j[10], j[7:0]};
++endfunction
++assign db15_joy_0 = db15_en ? db15_map(db15_1) : 16'd0;
++assign db15_joy_1 = db15_en ? db15_map(db15_2) : 16'd0;
++
+ reg [7:0] ioctl_index;
+ always @(posedge clk_sys) ioctl_index <= ioctl_idx;
+ 
+diff -ruN --strip-trailing-cr -x README_v10_TEST.md ex2/NeoGeoTREX_v9_TEST/rtl/io/neo_db15.v v10/NeoGeoTREX_v10_TEST/rtl/io/neo_db15.v
+--- ex2/NeoGeoTREX_v9_TEST/rtl/io/neo_db15.v	1970-01-01 01:00:00.000000000 +0100
++++ v10/NeoGeoTREX_v10_TEST/rtl/io/neo_db15.v	2026-10-14 21:38:34.220252764 +0100
+@@ -0,0 +1,61 @@
++// DB15 splitter (Antonio Villena design) reader for the MiSTer user port.
++// Same bit order and timing as joydb15.v by Aitor Pelaez (NeuroRulez), as used
++// by jtframe, but clocked from clk_sys with a clock enable instead of using a
++// counter bit as a clock. joy_clk = clk/16 (3 MHz at 48 MHz).
++// Outputs are active high: {Select,Start,F,E,D,C,B,A,Up,Down,Left,Right}.
++module neo_db15
++(
++	input             clk,
++	output            joy_clk,
++	output            joy_load,
++	input             joy_data,
++	output     [11:0] joystick1,
++	output     [11:0] joystick2
++);
++
++reg  [3:0] div = 4'd0;
++always @(posedge clk) div <= div + 4'd1;
++assign joy_clk = div[3];
++wire tick = (div == 4'd7);	// joy_clk rises on the next clk
++
++reg [11:0] joy1 = 12'hFFF, joy2 = 12'hFFF;
++reg  [4:0] cnt  = 5'd0;
++reg        load = 1'b1;
++assign joy_load = load;
++
++always @(posedge clk) if (tick) begin
++	load <= (cnt != 5'd0);
++	cnt  <= (cnt == 5'd25) ? 5'd0 : cnt + 5'd1;
++	case (cnt)
++		5'd2 : joy1[7]  <= joy_data;	// P1 D
++		5'd3 : joy1[6]  <= joy_data;	// P1 C
++		5'd4 : joy1[5]  <= joy_data;	// P1 B
++		5'd5 : joy1[4]  <= joy_data;	// P1 A
++		5'd6 : joy1[0]  <= joy_data;	// P1 Right
++		5'd7 : joy1[1]  <= joy_data;	// P1 Left
++		5'd8 : joy1[2]  <= joy_data;	// P1 Down
++		5'd9 : joy1[3]  <= joy_data;	// P1 Up
++		5'd10: joy2[0]  <= joy_data;	// P2 Right
++		5'd11: joy2[1]  <= joy_data;	// P2 Left
++		5'd12: joy2[2]  <= joy_data;	// P2 Down
++		5'd13: joy2[3]  <= joy_data;	// P2 Up
++		5'd14: joy1[9]  <= joy_data;	// P1 F
++		5'd15: joy1[8]  <= joy_data;	// P1 E
++		5'd16: joy1[11] <= joy_data;	// P1 Select
++		5'd17: joy1[10] <= joy_data;	// P1 Start
++		5'd18: joy2[9]  <= joy_data;	// P2 F
++		5'd19: joy2[8]  <= joy_data;	// P2 E
++		5'd20: joy2[11] <= joy_data;	// P2 Select
++		5'd21: joy2[10] <= joy_data;	// P2 Start
++		5'd22: joy2[7]  <= joy_data;	// P2 D
++		5'd23: joy2[6]  <= joy_data;	// P2 C
++		5'd24: joy2[5]  <= joy_data;	// P2 B
++		5'd25: joy2[4]  <= joy_data;	// P2 A
++		default: ;
++	endcase
++end
++
++assign joystick1 = ~joy1;
++assign joystick2 = ~joy2;
++
++endmodule
+diff -ruN --strip-trailing-cr -x README_v10_TEST.md ex2/NeoGeoTREX_v9_TEST/sys/emu_ports.vh v10/NeoGeoTREX_v10_TEST/sys/emu_ports.vh
+--- ex2/NeoGeoTREX_v9_TEST/sys/emu_ports.vh	2026-10-02 22:50:41.000000000 +0100
++++ v10/NeoGeoTREX_v10_TEST/sys/emu_ports.vh	2026-10-14 21:38:11.251048001 +0100
+@@ -147,6 +147,8 @@
+ // 1 - D-/TX
+ // 2..6 - USR2..USR6
+ // Set USER_OUT to 1 to read from USER_IN.
++// TREX: 1 = drive USER_OUT[1:0] push-pull (DB15 splitter clock/load).
++output        USER_PP,
+ input   [6:0] USER_IN,
+ output  [6:0] USER_OUT,
+ 
+diff -ruN --strip-trailing-cr -x README_v10_TEST.md ex2/NeoGeoTREX_v9_TEST/sys/sys_top.v v10/NeoGeoTREX_v10_TEST/sys/sys_top.v
+--- ex2/NeoGeoTREX_v9_TEST/sys/sys_top.v	2026-10-02 22:50:42.000000000 +0100
++++ v10/NeoGeoTREX_v10_TEST/sys/sys_top.v	2026-10-14 21:38:11.253287699 +0100
+@@ -1658,8 +1658,8 @@
+ 
+ ////////////////  User I/O (USB 3.0 connector) /////////////////////////
+ 
+-assign USER_IO[0] =                       !user_out[0]  ? 1'b0 : 1'bZ;
+-assign USER_IO[1] =                       !user_out[1]  ? 1'b0 : 1'bZ;
++assign USER_IO[0] = user_pp ? user_out[0] : !user_out[0]  ? 1'b0 : 1'bZ;
++assign USER_IO[1] = user_pp ? user_out[1] : !user_out[1]  ? 1'b0 : 1'bZ;
+ assign USER_IO[2] = !(SW[1] ? HDMI_I2S   : user_out[2]) ? 1'b0 : 1'bZ;
+ assign USER_IO[3] =                       !user_out[3]  ? 1'b0 : 1'bZ;
+ assign USER_IO[4] = !(SW[1] ? HDMI_SCLK  : user_out[4]) ? 1'b0 : 1'bZ;
+@@ -1708,6 +1708,7 @@
+ sync_fix sync_h(clk_vid, hs_emu, hs_fix);
+ 
+ wire  [6:0] user_out, user_in;
++wire        user_pp;
+ 
+ assign clk_ihdmi= clk_vid;
+ assign ce_hpix  = vga_ce_sl;
+@@ -1871,6 +1872,7 @@
+ 	.UART_DTR(uart_dsr),
+ 	.UART_DSR(uart_dtr),
+ 
++	.USER_PP(user_pp),
+ 	.USER_OUT(user_out),
+ 	.USER_IN(user_in)
+ );

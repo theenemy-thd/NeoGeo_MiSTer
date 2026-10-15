@@ -49,7 +49,10 @@ module neo_b1(
 	input nRST,
 	input DOGE,
 	
-	input EN_FIX
+	input EN_FIX,
+
+	input [11:0] XSPR_PIXEL,	// extra sprites (neo_xspr), drawn over the LSPC's
+	input XSPR_OPAQUE
 );
 
 	reg nCPU_ACCESS;
@@ -127,7 +130,8 @@ module neo_b1(
 
 	// Fix/Sprite/Blanking select
 	// KUQA KUTU JARA...
-	assign PA_MUX_A = FIX_OPAQUE ? {4'b0000, FIX_PAL_REG, FIX_COLOR} : RAM_MUX_OUT;
+	assign PA_MUX_A = FIX_OPAQUE ? {4'b0000, FIX_PAL_REG, FIX_COLOR} :
+							XSPR_OPAQUE ? XSPR_PIXEL : RAM_MUX_OUT;
 	assign PA_MUX_B = CHBL ? 12'h000 : PA_MUX_A;
 
 	// KAWE KESE...

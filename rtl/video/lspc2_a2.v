@@ -82,7 +82,13 @@ module lspc2_a2_sync(
 	output [15:0] VRAM_ADDR,        // CPU access address
 	output  [1:0] VRAM_CYCLE,
 	output        SVRAM_WR,         // Full cycle WR signal
-	output [15:0] LO_ROM_ADDR
+	output [15:0] LO_ROM_ADDR,
+	output        CPU_VRAM_BUSY,    // a CPU VRAM access is still in progress (68K overclock)
+	output        CPU_VRAM_WR_BUSY, // same, for writes: the read latches don't matter
+	output  [8:0] XSPR_RASTERC,     // for the extra sprite renderer (neo_xspr)
+	output  [8:0] XSPR_PIXELC,
+	output  [2:0] XSPR_AA_COUNT,
+	output        XSPR_AA_DISABLE
 );
 
 	wire [8:0] PIXELC;
@@ -723,6 +729,7 @@ module lspc2_a2_sync(
 	wire SPR_TILE_VFLIP, SPR_TILE_HFLIP, SPR_AA_3, SPR_AA_2, nCPU_WR_LOW, R91_nQ, T160A_OUT, T160B_OUT, CLK_ACTIVE_RD_EN;
 	wire ACTIVE_RD_PRE8;
 	wire PIXEL_H8_RISE = LSPC_EN_6M_N && PIXELC[3:0] == 4'b0111;
+	wire CPU_RD_LOW_UPD, CPU_RD_HIGH_UPD;	// read latch reloads, for CPU_VRAM_BUSY
 	slow_cycle_sync SCY_SYNC(CLK, CLK_EN_24M_P, LSPC_12M, LSPC_EN_12M_N, LSPC_EN_12M_P, LSPC_6M, LSPC_EN_6M_N, LSPC_3M, LSPC_EN_1_5M_N,
 							nRESETP, VRAM_ADDR[14:0], VRAM_WRITE,
 							REG_VRAMADDR[15], PIXELC[3], PIXEL_H8_RISE, PIXELC[8], RASTERC[7:3], PIXEL_HPLUS, ACTIVE_RD,
@@ -730,7 +737,7 @@ module lspc2_a2_sync(
 							FIX_TILE, FIX_PAL, SPR_TILE, SPR_PAL, VRAM_LOW_READ, nCPU_WR_LOW, R91_nQ,
 							T160A_OUT, T160B_OUT, CLK_ACTIVE_RD_EN, ACTIVE_RD_PRE8, Q174B_OUT,
 							CLK_SPR_ATTR_EN, SPRITEMAP_ADDR_MSB, CLK_SPR_TILE_EN, P222A_OUT_RISE, ~P201_Q[1],
-							SVRAM_ADDR, SVRAM_DATA_IN, SVRAM_DATA_OUT, BOE, BWE, FIXMAP_ADDR, SPRMAP_ADDR, VRAM_CYCLE);
+							SVRAM_ADDR, SVRAM_DATA_IN, SVRAM_DATA_OUT, BOE, BWE, FIXMAP_ADDR, SPRMAP_ADDR, VRAM_CYCLE, CPU_RD_LOW_UPD);
 	
 	wire nCPU_WR_HIGH, R91_Q, SPR_SIZE0, SPR_SIZE5, O159_QB;
 
@@ -739,7 +746,7 @@ module lspc2_a2_sync(
 							PIXELC, RASTERC, P50_CO, nCPU_WR_HIGH, HSHRINK, PIPE_C, VRAM_HIGH_READ,
 							ACTIVE_RD, R91_Q, R91_nQ, T140_Q, T58A_OUT, T73A_OUT, U129A_Q, T125A_OUT, T125A_OUT_RISE,
 							CLK_ACTIVE_RD_EN, ACTIVE_RD_PRE8, SPR_Y, YSHRINK, SPR_SIZE0, SPR_SIZE5, O159_QB,
-							FVRAM_ADDR, FVRAM_DATA_IN, FVRAM_DATA_OUT, CWE);
+							FVRAM_ADDR, FVRAM_DATA_IN, FVRAM_DATA_OUT, CWE, CPU_RD_HIGH_UPD);
 	
 	autoanim_sync AA_SYNC(CLK, RASTERC[8], nRESETP, AA_SPEED, AA_COUNT);
 	
@@ -748,4 +755,43 @@ module lspc2_a2_sync(
 	wire nHSHRINK_OUT_A = ~HSHRINK_OUT_A;
 	wire nHSHRINK_OUT_B = ~HSHRINK_OUT_B;
 	
+	// CPU VRAM access tracking, used only when the 68000 is overclocked.
+	// Busy while a CPU write is waiting for its VRAM slot, and after the VRAM
+	// address changes until both read latches (low and high VRAM) are reloaded.
+	// At 12MHz the 68000 is never fast enough to catch the LSPC busy.
+	// The VRAM address register (F14) loads a clock or two after D112B_OUT
+	// goes back high, so a latch reload in those first clocks still holds the
+	// old address: reloads only count once the address has settled.
+	reg  rd_stale_lo = 1'b0, rd_stale_hi = 1'b0;
+	reg  [2:0] addr_settle = 3'd0;
+	always @(posedge CLK) begin
+		if (~D112B_OUT) begin		// VRAM address being updated (active low pulse)
+			rd_stale_lo <= 1'b1;
+			rd_stale_hi <= 1'b1;
+			addr_settle <= 3'd7;
+		end else if (addr_settle != 3'd0) begin
+			addr_settle <= addr_settle - 3'd1;
+		end else begin
+			if (CPU_RD_LOW_UPD)  rd_stale_lo <= 1'b0;
+			if (CPU_RD_HIGH_UPD) rd_stale_hi <= 1'b0;
+		end
+	end
+	// registered: D112B_OUT depends on the (gated) CPU strobes, so a combinational
+	// busy would loop back into the gating. The 1-clock lag is harmless: the
+	// access that caused it was already granted, and the next one is many clocks later.
+	reg  vram_busy_r = 1'b0, vram_wr_busy_r = 1'b0;
+	always @(posedge CLK) begin
+		vram_busy_r    <= ~nVRAM_WRITE_REQ | ~D112B_OUT | rd_stale_lo | rd_stale_hi;
+		// a write only needs the previous write done and the address settled;
+		// waiting for the read latches made VRAM write loops slower than 12MHz
+		vram_wr_busy_r <= ~nVRAM_WRITE_REQ | ~D112B_OUT | (addr_settle != 3'd0);
+	end
+	assign CPU_VRAM_BUSY    = vram_busy_r;
+	assign CPU_VRAM_WR_BUSY = vram_wr_busy_r;
+
+	assign XSPR_RASTERC    = RASTERC;
+	assign XSPR_PIXELC     = PIXELC;
+	assign XSPR_AA_COUNT   = AA_COUNT;
+	assign XSPR_AA_DISABLE = AA_DISABLE;
+
 endmodule

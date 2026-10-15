@@ -39,6 +39,7 @@ module sdram_mux(
 	input      [26:0] P2ROM_ADDR,
 	output reg [15:0] PROM_DATA,
 	output reg        PROM_DATA_READY,
+	output            CD_WR_PENDING,	// 68000 write to CD RAM (work RAM, FIX, SPR) not yet started in SDRAM
 
 	input             PCK2,
 	input      [15:0] S_LATCH,
@@ -81,12 +82,29 @@ module sdram_mux(
 	input             CD_TR_WR_SPR,
 	input             CD_USE_FIX,
 	input             CD_TR_RD_FIX,
-	input             CD_TR_WR_FIX
+	input             CD_TR_WR_FIX,
+
+	// Extra sprite renderer (neo_xspr): C ROM reads, lowest priority
+	input             XS_REQ,        // toggle
+	input      [26:0] XS_ADDR,
+	output reg        XS_ACK = 0,    // toggles when XS_DATA is valid
+	output reg [63:0] XS_DATA
 );
 
 	localparam P2ROM_OFFSET = 27'h0300000;
 
-	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN;
+	reg M68K_RD_RUN, SFIX_RD_RUN, CROM_RD_RUN, CD_TR_RUN, XS_RD_RUN;
+
+	// The LSPC's sprite and fix fetches must be done soon after PCK1/PCK2
+	// fall (sprite data is used 24 cycles later). Extra sprite reads only
+	// start where they can't delay those: from 4 to 54 cycles after both.
+	// PCK1 and PCK2 each fall every 64 cycles.
+	reg  [6:0] pck1_cnt = 7'h7F, pck2_cnt = 7'h7F;
+	reg        xs_win;              // registered: counters as of the previous cycle
+	reg        xs_req_r;
+	reg        xs_busy;
+	wire       xs_pending = (xs_req_r != XS_ACK) & ~XS_RD_RUN & ~xs_busy;
+	reg  [1:0] xs_shift = 2'b11;
 
 	reg SDRAM_M68K_SIG_SR;
 	reg SDRAM_CROM_SIG_SR;
@@ -107,6 +125,11 @@ module sdram_mux(
 	wire CD_WR_SDRAM_SIG = CD_EXT_WR | CD_TR_WR_FIX | CD_TR_WR_SPR;
 	wire CD_LDS_ONLY_WR = CD_TR_WR_FIX;
 
+	// The write takes its address and data from the 68000 bus when it starts,
+	// which can be several SDRAM accesses after the request (sprite, fix and
+	// 68000 reads go first). The 68000 must still be in that bus cycle then;
+	// neogeo.sv holds DTACK while this is high (only when overclocked).
+
 	wire [24:0] CD_REMAP_TR_ADDR;
 	always_comb begin
 		casez({CD_EXT_RD, CD_EXT_WR, CD_TR_AREA})
@@ -126,8 +149,11 @@ module sdram_mux(
 		endcase
 	end
 	
+	reg CD_WR_REQ = 0;
+	assign CD_WR_PENDING = (REQ_CD_WR | CD_WR_REQ) & ~DMA_RUNNING;
+
 	always @(posedge CLK) begin
-		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, CD_WR_REQ, RFSH_REQ;
+		reg M68K_RD_REQ, SROM_RD_REQ, CROM_RD_REQ, RFSH_REQ;
 		reg nAS_PREV;
 		reg old_ready;
 		reg [8:0] refresh_cnt;
@@ -151,6 +177,21 @@ module sdram_mux(
 			cr_shift <= cr_shift - 1'd1;
 		end
 
+		// extra sprite reads: collect the other 3 words, then acknowledge
+		xs_req_r <= XS_REQ;
+		pck1_cnt <= (SDRAM_CROM_SIG_SR & ~PCK1) ? 7'd0 : (&pck1_cnt ? pck1_cnt : pck1_cnt + 1'd1);
+		pck2_cnt <= (SDRAM_SROM_SIG_SR & ~PCK2) ? 7'd0 : (&pck2_cnt ? pck2_cnt : pck2_cnt + 1'd1);
+		xs_win   <= (pck1_cnt >= 7'd3) && (pck1_cnt <= 7'd53 || &pck1_cnt) &&
+		            (pck2_cnt >= 7'd3) && (pck2_cnt <= 7'd53 || &pck2_cnt);
+		if(~&xs_shift) begin
+			XS_DATA[xs_shift*16 +:16] <= SDRAM_DOUT;
+			xs_shift <= xs_shift - 1'd1;
+			if(!xs_shift) begin
+				XS_ACK  <= ~XS_ACK;
+				xs_busy <= 0;
+			end
+		end
+
 		nAS_PREV <= nAS;
 
 		CD_RD_SDRAM_SIG_SR <= CD_RD_SDRAM_SIG;
@@ -169,6 +210,10 @@ module sdram_mux(
 			CD_WR_REQ   <= 0;
 
 			CROM_RD_RUN <= 0;
+			XS_RD_RUN   <= 0;
+			xs_busy     <= 0;
+			xs_shift    <= 2'b11;
+			XS_ACK      <= xs_req_r;
 			SFIX_RD_RUN <= 0;
 			M68K_RD_RUN <= 0;
 			CD_TR_RUN   <= 0;
@@ -232,6 +277,11 @@ module sdram_mux(
 					CROM_RD_RUN    <= 0;
 					cr_shift       <= 2;
 				end
+				if (XS_RD_RUN) begin
+					XS_DATA[63:48] <= SDRAM_DOUT;
+					XS_RD_RUN      <= 0;
+					xs_shift       <= 2;
+				end
 
 				// Start requested access, if needed
 				if (M68K_RD_REQ | REQ_M68K_RD) begin
@@ -288,6 +338,12 @@ module sdram_mux(
 					
 					SDRAM_DIN      <= DMA_RUNNING ? (CD_LDS_ONLY_WR ? {DMA_DATA_OUT[7:0],DMA_DATA_OUT[7:0]} : DMA_DATA_OUT) :
 															  (CD_LDS_ONLY_WR ? {M68K_DATA[7:0],   M68K_DATA[7:0]}    : M68K_DATA);
+				end
+				else if (xs_pending & xs_win & ~REFRESH_EN) begin
+					XS_RD_RUN      <= 1;
+					xs_busy        <= 1;
+					SDRAM_RD       <= 1;
+					SDRAM_ADDR     <= XS_ADDR[26:1];
 				end
 				else if(REQ_RFSH & RFSH_REQ) begin
 					RFSH_REQ       <= 0;
